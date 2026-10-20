@@ -232,6 +232,26 @@ the cost straight back.
 
 → **Keep WAHA on DOKS.** It's the only option that is free or nearly free.
 
+### 3.7 WAHA Core features we can now use
+
+Checked in the `gows-2026.9.2` Core image: the GOWS engine implements these, and Core no
+longer restricts them. Core also supports **multiple sessions** now.
+
+| WAHA feature | How we'd use it | When |
+|---|---|---|
+| **Fetch chat history** (`GET /api/{session}/chats/{chatId}/messages`) | **Catch-up / reconcile**: after WAHA restarts, a webhook failure or Lambda errors, re-read the group's messages since the last processed one and run them through the parser (deduped by message id). This means a missed webhook never loses a status. | MVP (phase 3) |
+| **Reactions** (`PUT /api/reaction`) | React **👍** to a member's message once its changes are applied, so they can see the bot picked it up. Messages with nothing to apply get no reaction. | MVP (phase 3) |
+| **Groups + participants** (`GET /api/{session}/groups`, `.../participants`) | Choose the target group from a list in the template editor. Show who's in the group. Map participant numbers to POCs, which is the basis for the later "only the POC can update" restriction. | MVP (phase 2) |
+| **Reply / quote** (`reply_to` on `sendText`) | Update and closing messages quote the original checklist, so they stay together in the group. | MVP (phase 2) |
+| **Mentions** (`mentions` on `sendText`) | Reminders **@mention** the POCs whose services are still ❓. Needs the POC→number mapping. | Later |
+| **Multiple sessions** | Optional: a second number as a separate "test" session alongside production, in the same pod. | Optional |
+| **Prometheus metrics** (`WAHA_PROMETHEUS_ENABLED`) | Only if the cluster already runs Prometheus/Grafana. | Optional |
+| Polls, events, labels, Chatwoot/MCP apps, S3/Postgres media & session storage | Not useful for this workflow, or would add cost or complexity. | Not used |
+
+Still Plus-only in this build: **API key management** (multiple keys) and image/voice/video
+**status** posts. We need neither. The spike checks each "MVP" row on the real number
+before we build on it.
+
 ## 4. Restricting access to the web app
 
 **Cloudflare Access when DNS stays in Route 53:** Access only works when traffic goes
@@ -328,6 +348,10 @@ The parser is a **pure function** with tests run against real reposts from the t
 | F9 | Delete one of our sent messages | From the list of sent messages in the verification view |
 | F10 | Session health and QR alerts | §6 |
 | F11 | Access control | §4 |
+| F12 | Catch-up from chat history | §3.7. Runs on WAHA reconnect (`session.status` → `WORKING`) and on the health-check cron |
+| F13 | 👍 reaction on applied updates | §3.7 |
+| F14 | Group picker + participant list | §3.7 |
+| F15 | Updates/closing quote the original message | §3.7 |
 
 ## 8. Data model (DynamoDB, single table with ElectroDB)
 
@@ -400,8 +424,7 @@ levels at this volume. **Total about US$0.20–1/month.**
 ## 12. Future enhancements
 
 - Restrict updates for a service to its mapped POC(s), matched by sender phone number.
-- Reminders ("3 services still ❓"), sent automatically or by an admin with one click.
-- React to the sender's message with 👍 once their changes are applied.
+- Reminders ("3 services still ❓"), sent automatically or by an admin with one click, **@mentioning** the outstanding POCs.
 - Accept quoted replies and emoji reactions as status updates.
 - CSV/PDF export of a closed verification.
 - Cloudflare Access, if a suitable Cloudflare zone becomes available.
