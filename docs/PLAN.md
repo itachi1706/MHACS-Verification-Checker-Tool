@@ -48,45 +48,108 @@ post an updated list or close the verification.
   the team). The remaining risk is the usual one for unofficial integrations: WhatsApp
   could ban the number. Low volume and a dedicated number keep this risk small.
 
-## 3. The key constraint: WAHA cannot run in Lambda
+## 3. Hosting: Lambda on AWS, WAHA on DigitalOcean Kubernetes
 
-WAHA keeps a **permanent WebSocket connection** to WhatsApp and stores session files on
-disk. Lambda is short-lived and stateless, so it can't host WAHA. The rest of the system
-can be serverless.
+WAHA keeps a **permanent WebSocket connection** to WhatsApp and stores its session files
+on disk. Lambda is short-lived and stateless, so it can't host WAHA. WAHA runs on the
+team's existing **DigitalOcean Kubernetes (DOKS)** cluster. Everything else stays
+serverless on AWS.
 
-| Component | Runs on | Why |
-|---|---|---|
-| Web app (Next.js) | **Lambda + CloudFront** via SST/OpenNext | As planned |
-| Webhook receiver, WAHA→app | **Lambda** (separate function) | Event-driven, cheap |
-| Health check / reminders | **Lambda on a cron** (EventBridge) | Event-driven |
-| Data | **DynamoDB** | No server to run, costs nothing when idle, works well with SST. The data set is tiny. |
-| **WAHA** | **ECS Fargate** service, 1 task, with an **EFS** volume for the session (SST `sst.aws.Service`) | Needs to run all the time. The EFS volume keeps the login across restarts, so no new QR scan after each deploy. |
+| Component | Runs on |
+|---|---|
+| Web app (Next.js) | AWS Lambda + CloudFront (SST/OpenNext) |
+| Webhook receiver (WAHA → app) | AWS Lambda, own function URL |
+| Health check cron | AWS Lambda + EventBridge |
+| App data | DynamoDB |
+| Alerts | SES (SMTP/API) |
+| **WAHA** | **DOKS**: a Deployment with 1 replica, a persistent volume, and an Ingress with TLS |
 
-Cheaper fallback if Fargate is overkill: run WAHA on a small EC2 or Lightsail instance
-(about US$5/month) with Docker and a local volume.
+### 3.1 Docker image
 
-### Networking
+No custom image is needed. We use the **official `devlikeapro/waha` image**, pinned to a
+specific version tag (never `latest`), and configure it with env vars and a Secret. If
+we need anything custom later, it would be a thin `FROM devlikeapro/waha:<ver>` layer.
+What we deliver is **Kubernetes manifests** (or a Kustomize overlay) for the cluster.
+
+### 3.2 Storage: does WAHA need a database?
+
+**No separate database. It does need a persistent volume.**
+
+- WAHA *Core* (free) stores the WhatsApp session (keys and login state) as **files on
+  disk**. GOWS/NOWEB keep a small local store in the same folder. Without a persistent
+  volume, every pod restart logs the bot out and needs a new QR scan.
+- → **PVC of 1–2 GiB** (`ReadWriteOnce`, `do-block-storage`), mounted at the sessions path
+  (`/app/.sessions`). Add `/app/.media` only if we ever handle media.
+- Saving sessions to Postgres/MongoDB is a WAHA *Plus* (paid) feature. We don't need it.
+- Our own app data (verifications, statuses, audit) lives in **DynamoDB**, not in WAHA.
+- DO block storage costs about US$0.10/GiB/month, so **about US$0.20/month**.
+
+### 3.3 Kubernetes shape
+
+```yaml
+# Deployment: waha (namespace: mhacs-verify)
+replicas: 1                 # exactly one; two pods would fight over the same WhatsApp session
+strategy: { type: Recreate } # old pod stops before the new one starts (RWO volume, single session)
+image: devlikeapro/waha:<pinned-version>
+env:
+  WHATSAPP_DEFAULT_ENGINE: GOWS       # or NOWEB; no Chromium, ~200–400 MB RAM
+  WAHA_API_KEY:          <from Secret>   # required on every API call (X-Api-Key)
+  WHATSAPP_HOOK_URL:     https://<webhook-lambda-url>/waha
+  WHATSAPP_HOOK_EVENTS:  message,session.status
+  WHATSAPP_HOOK_HMAC_KEY: <from Secret>  # webhook body signed, Lambda verifies
+  WAHA_DASHBOARD_ENABLED: "false"     # admin UI lives in our web app instead
+  WHATSAPP_SWAGGER_ENABLED: "false"
+volumeMounts: /app/.sessions -> PVC waha-sessions (1Gi)
+resources: requests 100m / 384Mi, limits 500m / 768Mi
+probes: GET /ping  (liveness/readiness)
+---
+Service: ClusterIP :3000
+Ingress: waha.<domain> -> Service, TLS via cert-manager,
+         nginx.ingress.kubernetes.io/whitelist-source-range: <Lambda NAT EIP>/32
+```
+
+The env var names above follow WAHA's docs. We'll check them against the pinned version
+during the spike.
+
+### 3.4 Does WAHA need restrictions? **Yes, it does.**
+
+Anyone who can call the WAHA API **controls the bot's WhatsApp account**. They can read
+all its chats and groups, send messages as the bot, and log the session out. So:
+
+1. **Always (no extra cost):**
+   - TLS on the Ingress.
+   - A long random **`WAHA_API_KEY`**, so every call without it is rejected.
+   - WAHA's own dashboard and Swagger turned off.
+2. **Recommended: IP allowlist on the Ingress** so only our Lambdas can reach it. The
+   catch is that **Lambda has no fixed outgoing IP** by default. Getting one means putting
+   the Lambdas that call WAHA in a VPC behind a NAT with an Elastic IP. SST
+   `Vpc({ nat: "ec2" })` does this for about US$3–5/month. The NAT's Elastic IP is the one
+   address to allowlist on the DOKS Ingress.
+   - Without the NAT, the protection is TLS plus the API key. That's acceptable for a
+     start, but adding the allowlist later is strongly recommended.
+
+**The other direction (WAHA → webhook Lambda):** DOKS sends traffic out from the
+**node IPs**, which change when the node pool is recycled or upgraded. So the webhook
+Lambda checks **WAHA's HMAC signature** instead of an IP. Allowlisting node IPs there
+would be optional and fragile.
+
+### 3.5 Networking
 
 ```
- Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda (OpenNext) ──┐
-   (IP allowlist / CF Access)                                       │ private VPC
-                                                                    ▼
- WhatsApp ◄──linked device──  WAHA (Fargate, private subnet) ◄── REST + X-Api-Key
-                                  │
-                                  └── webhook (HMAC-signed) ──► Webhook Lambda
-                                                                   │
-                                                 DynamoDB ◄────────┘
+ Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda ─┐
+  (IP allowlist + login)                                  │ (VPC + NAT EIP, optional)
+                                                          ▼
+                              DOKS Ingress (TLS, allowlist: NAT EIP) ──► WAHA pod + PVC
+                                                                           │    ▲
+ WhatsApp ◄──────────────────────── linked device ─────────────────────────┘    │
+                                                                                │
+ Webhook Lambda ◄──── HTTPS, HMAC-signed (message, session.status) ─────────────┘
+       │
+       └──► DynamoDB      Health-check cron Lambda ──► WAHA /api/sessions ──► SES alert
 ```
 
-- WAHA runs in a **private subnet** with no public endpoint. The Next.js and webhook
-  Lambdas run in the same SST `Vpc` and call WAHA on its private address using the WAHA
-  API key.
-- WAHA still needs outbound internet. Use SST's `Vpc` with `nat: "ec2"` (a cheap NAT
-  instance, about US$3–5/month instead of about US$32 for a NAT Gateway). Add a free
-  DynamoDB gateway endpoint.
-- WAHA → webhook Lambda: a Lambda Function URL (or API Gateway) that is **not behind**
-  the admin IP allowlist. It is secured by checking WAHA's webhook **HMAC**
-  (`X-Webhook-Hmac`, SHA-512) and, optionally, by allowing only the NAT's Elastic IP.
+If the Lambdas run inside a VPC, add a free **DynamoDB gateway endpoint**. SES goes out
+through the NAT.
 
 ## 4. Restricting access to the web app
 
@@ -160,7 +223,7 @@ The parser is a **pure function** with tests run against real reposts from the t
   `SCAN_QR_CODE`, `FAILED`, `STOPPED`). Anything other than `WORKING` → **notify the
   admins**.
 - The alert can't go over WhatsApp, because the bot's own session is the thing that's
-  down. Use **email (SES)** first. Optionally also a Telegram bot message, or SNS→SMS.
+  down. Alerts go out by **email via SES** (SMTP or API; confirmed by the team).
 - The **cron health check** (every 5–10 minutes) calls WAHA `GET /api/sessions/default`.
   It catches the case where WAHA itself has crashed and so can't send a webhook. Alerts
   are de-duplicated, so admins get one message per incident.
@@ -214,7 +277,10 @@ layer would change.
 | Editing messages | Never. Original and updates are sent as new messages. Deleting our own messages is supported. |
 | Who can update | Anyone in the group, for now |
 | Unknown services | Pending suggestion for an admin to approve in the web app |
-| Hosting | AWS: SST + OpenNext on Lambda. WAHA on Fargate (see §3). |
+| Hosting | AWS: SST + OpenNext on Lambda. WAHA on the existing **DigitalOcean Kubernetes** cluster, using the official image plus manifests (see §3). |
+| WAHA storage | No database. One 1–2 GiB PVC for session files (see §3.2). |
+| WAHA access | TLS + API key always. Ingress allowlist set to the Lambda NAT Elastic IP (recommended). Webhooks verified by HMAC. |
+| Alerts | Email via SES |
 | Access | Cloudflare Access if feasible (see §4), otherwise an IP allowlist from env vars, plus app login |
 | Language | TypeScript throughout. WAHA is a REST API, so Python adds nothing. TS types come from WAHA's OpenAPI spec. |
 
@@ -222,7 +288,8 @@ layer would change.
 
 ```
 /                       SST v3 monorepo (pnpm workspaces)
-├─ sst.config.ts        Vpc, Efs, Cluster+Service(WAHA), Dynamo, Nextjs, Functions, Cron
+├─ sst.config.ts        Vpc (+NAT EIP), Dynamo, Nextjs, Functions, Cron, SES
+├─ deploy/k8s/waha/     Namespace, Secret (template), PVC, Deployment, Service, Ingress (Kustomize)
 ├─ packages/
 │  ├─ core/             domain logic: parser, renderer, entities, WAHA client (pure TS + tests)
 │  ├─ web/              Next.js admin app (OpenNext)
@@ -235,15 +302,16 @@ layer would change.
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0: Spike** | Run WAHA locally in Docker and link the Business number. Send to the test group. Record real webhook payloads and reposts. Choose the engine (**GOWS** or **NOWEB**: no Chromium, low memory) and check the needed features work in the free *Core* tier (one session is enough). | Sending, receiving, deleting and session-status events all work |
-| **1: Foundations** | SST infra (VPC, Fargate WAHA, EFS, DynamoDB, Next.js). IP allowlist. Admin login. | The admin app is reachable only from allowed IPs, and WAHA is reachable from the Lambdas |
+| **1: Foundations** | WAHA manifests deployed to DOKS (PVC, Ingress, TLS, API key). SST infra (VPC + NAT EIP, DynamoDB, Next.js). IP allowlists on both sides. Admin login. | The admin app is reachable only from allowed IPs. WAHA is reachable only from the NAT EIP. Pod restarts don't log the bot out. |
 | **2: MVP sending** | Services, groups and templates CRUD. Wizard, preview, send. Manual grid, send update, close, delete message. | A full verification can be run by hand |
 | **3: Auto-parsing** | Webhook, parser (with tests from real reposts), audit feed, suggestions | Reposts in the test group update the grid by themselves |
 | **4: Ops** | Session alerts (SES), health cron, QR/pairing page, backups (DynamoDB PITR) | A forced logout produces an email within 10 minutes |
 | **5: Go-live** | Switch the template's target to the real group | — |
 
-Rough running cost: Fargate (0.25 vCPU / 1 GB) about US$9, NAT instance about US$3–5, EFS
-under US$1. Lambda, DynamoDB and CloudFront are about free at this volume. **Total about
-US$15/month.** A Lightsail host for WAHA would bring that to about US$5–8.
+Rough added running cost: WAHA uses spare capacity on the existing DOKS cluster, plus about
+US$0.20 for the PVC. The optional NAT instance with a fixed Elastic IP is about US$3–5.
+Lambda, DynamoDB, CloudFront and SES are about free at this volume. **Total about
+US$0–5/month.**
 
 ## 12. Future enhancements
 
