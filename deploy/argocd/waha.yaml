@@ -10,6 +10,10 @@ spec:
     repoURL: https://github.com/itachi1706/MHACS-Verification-Checker-Tool.git
     targetRevision: main
     path: deploy/k8s/waha/overlays/ingress-nginx
+    # Render with kustomize, then fill <path:...> placeholders from OpenBao.
+    # Use the name of your argocd-vault-plugin CMP for kustomize.
+    plugin:
+      name: argocd-vault-plugin-kustomize
   destination:
     server: https://kubernetes.default.svc
     namespace: mhacs-verify

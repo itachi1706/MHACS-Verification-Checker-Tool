@@ -71,10 +71,12 @@ Needs `doctl` (authenticated) and `psql`.
    SHOW max_connections;
    SELECT count(*) FROM pg_stat_activity;
    ```
-5. **Connection string for the `waha-env` secret** (step 2):
+5. **Connection string.** `base/secrets.yaml` builds it from OpenBao (§2):
    ```
-   postgres://waha:<strong-password>@<private-host>:25060/waha_mhacs?sslmode=require
+   postgres://<db_user>:<db_password>@<common host>:<common port>/waha_mhacs?sslmode=require
    ```
+   `kv/data/k8s/common/postgres#host` must be the **private** VPC hostname, and `#port` the
+   direct port (25060).
    - Connect **directly** on 25060, not through a PgBouncer connection pool.
    - WAHA uses TLS but doesn't verify the server certificate (Node `rejectUnauthorized:
      false`). That's acceptable on the private VPC hostname.
@@ -102,28 +104,55 @@ scripts/certs.sh waha.<your-domain>     # writes ./certs (gitignored)
 Keep `certs/ca.key` offline (e.g. in a password manager). The Lambdas get `ca.crt`,
 `client.crt` and `client.key` later as SST secrets.
 
-## 2. Secrets (created by hand, not stored in git)
+## 2. Secrets (OpenBao + argocd-vault-plugin)
+
+`base/secrets.yaml` defines both Secrets with argocd-vault-plugin placeholders
+(`<path:kv/data/...#key>`). Argo CD fills them from OpenBao when it renders the manifests,
+the same way as your other apps. Nothing secret is committed.
+
+| Secret / key | OpenBao path `#key` |
+|---|---|
+| `waha-env` `WAHA_API_KEY` | `kv/data/k8s/mhacs-verify/waha#api_key` |
+| `waha-env` `WHATSAPP_HOOK_HMAC_KEY` | `kv/data/k8s/mhacs-verify/waha#hook_hmac_key` |
+| `waha-env` `WHATSAPP_HOOK_URL` | `kv/data/k8s/mhacs-verify/waha#hook_url` |
+| `waha-env` `WHATSAPP_SESSIONS_POSTGRESQL_URL` | built from `kv/data/k8s/mhacs-verify/waha#db_user`, `#db_password` and the shared `kv/data/k8s/common/postgres#host`, `#port` |
+| `waha-mtls` `tls.crt` / `tls.key` / `ca.crt` | `kv/data/k8s/mhacs-verify/waha-mtls#tls_crt` / `#tls_key` / `#ca_crt` |
+
+Write the values (KV v2 mounted at `kv`; the CLI path omits `/data/`):
 
 ```bash
-kubectl create namespace mhacs-verify   # or let Argo CD create it first
+bao kv put kv/k8s/mhacs-verify/waha \
+  api_key="$(openssl rand -hex 32)" \
+  hook_hmac_key="$(openssl rand -hex 32)" \
+  hook_url="" \
+  db_user=waha \
+  db_password="<hex password from §0.1>"
 
-kubectl -n mhacs-verify create secret generic waha-mtls \
-  --from-file=tls.crt=certs/server.crt \
-  --from-file=tls.key=certs/server.key \
-  --from-file=ca.crt=certs/ca.crt
-
-kubectl -n mhacs-verify create secret generic waha-env \
-  --from-literal=WAHA_API_KEY="$(openssl rand -hex 32)" \
-  --from-literal=WHATSAPP_HOOK_HMAC_KEY="$(openssl rand -hex 32)" \
-  --from-literal=WHATSAPP_SESSIONS_POSTGRESQL_URL='postgres://waha:<password>@private-<db-host>:25060/defaultdb?sslmode=require'
-# Add WHATSAPP_HOOK_URL=https://<webhook-lambda-url>/waha once the SST app is deployed.
+bao kv put kv/k8s/mhacs-verify/waha-mtls \
+  tls_crt=@certs/server.crt \
+  tls_key=@certs/server.key \
+  ca_crt=@certs/ca.crt
 ```
 
-Save the API key and HMAC key; the Lambdas need both. WAHA hashes the API key on startup.
-Clients still send the plain key in the `X-Api-Key` header.
+- **`hook_url`** stays empty (no webhooks) until the SST app is deployed. Then set it with
+  `bao kv patch kv/k8s/mhacs-verify/waha hook_url=https://<webhook-lambda-url>/waha`. If
+  your AVP setup rejects empty values, use a placeholder such as `https://example.invalid/waha`.
+- **Why a dedicated `waha` user:** only the host and port come from the shared
+  `k8s/common/postgres` entry. The user gets its own hex password because WAHA reads
+  the password from the URL without percent-decoding it, so a shared password with special
+  characters would fail. If the shared user's password is plain alphanumeric and it owns
+  the two databases, you can point `db_user`/`db_password` at `k8s/common/postgres` instead.
+- **AVP's OpenBao policy** must allow reading `kv/data/k8s/mhacs-verify/*` as well as
+  `kv/data/k8s/common/*`. For example:
+  ```hcl
+  path "kv/data/k8s/mhacs-verify/*" { capabilities = ["read"] }
+  ```
+- The Lambdas need `api_key` and `hook_hmac_key` too. Copy them into SST secrets
+  (`sst secret set ...`).
 
-Neither secret is in git, so Argo CD doesn't manage or prune them. If you later use
-Sealed Secrets or External Secrets, add the resources to `base/` with the same names.
+**Changing a value later:** update it in OpenBao, then **Hard Refresh** the app in Argo CD
+(AVP only fetches values when it renders) and sync. The pod restarts on its own if Stakater
+Reloader is installed. Otherwise run `kubectl -n mhacs-verify rollout restart deploy/waha`.
 
 ## 3. Expose port 9443: ingress-nginx Helm values
 
@@ -162,14 +191,31 @@ kubectl -n ingress-nginx get svc ingress-nginx-controller \
 kubectl apply -f deploy/argocd/waha.yaml
 ```
 
+- **Plugin:** the Application renders through your argocd-vault-plugin **Config
+  Management Plugin** (`spec.source.plugin.name: argocd-vault-plugin-kustomize`). Change the
+  name to match your CMP. It has to run `kustomize build .` and pipe the output into
+  `argocd-vault-plugin generate -`. If your existing AVP plugin only does Helm, add a
+  kustomize variant. A typical sidecar `plugin.yaml`:
+  ```yaml
+  apiVersion: argoproj.io/v1alpha1
+  kind: ConfigManagementPlugin
+  metadata:
+    name: argocd-vault-plugin-kustomize
+  spec:
+    generate:
+      command: ["sh", "-c"]
+      args: ["kustomize build . | argocd-vault-plugin generate -"]
+  ```
 - **Private repo:** first add the repo to Argo CD (UI → Settings → Repositories, or
   `argocd repo add https://github.com/itachi1706/MHACS-Verification-Checker-Tool.git
   --username <user> --password <fine-grained PAT with read-only Contents>`).
 - Uses `project: default`. Change it if you restrict projects. The project must allow
   namespace `mhacs-verify`, and the cluster-scoped `Namespace` kind.
 - The namespace (and the PVC, if you use `local-sessions`) is annotated
-  `Prune=false,Delete=false`, so Argo CD never removes the hand-made secrets or the session.
-- `base/vmservicescrape.yaml` needs the VictoriaMetrics operator CRDs. See section 10.
+  `Prune=false,Delete=false`, so Argo CD never deletes the session data.
+- `base/vmservicescrape.yaml` needs the VictoriaMetrics operator CRDs. See §10.
+- If a sync fails with `<path:...>` still in a Secret, AVP couldn't read that path. Check
+  the key exists in OpenBao and AVP's policy covers it.
 
 ## 6. Link the WhatsApp Business number
 
@@ -233,13 +279,13 @@ The port, hostname and certificates stay the same, so nothing changes on the Lam
 
 ```bash
 scripts/certs.sh waha.<your-domain>     # reuses the CA, re-issues server + client certs
-kubectl -n mhacs-verify create secret generic waha-mtls \
-  --from-file=tls.crt=certs/server.crt --from-file=tls.key=certs/server.key \
-  --from-file=ca.crt=certs/ca.crt --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n mhacs-verify rollout restart deployment/waha
+bao kv put kv/k8s/mhacs-verify/waha-mtls \
+  tls_crt=@certs/server.crt tls_key=@certs/server.key ca_crt=@certs/ca.crt
 ```
 
-Then update the client cert in SST (`sst secret set ...`).
+Hard Refresh and sync in Argo CD (the pod restarts through Reloader, or run
+`kubectl -n mhacs-verify rollout restart deploy/waha`). Then update the client cert in SST
+(`sst secret set ...`).
 
 ## 10. Metrics (VictoriaMetrics) / Grafana
 

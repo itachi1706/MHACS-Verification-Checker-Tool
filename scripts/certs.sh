@@ -54,9 +54,8 @@ Done. Files in $(pwd):
   server.*    WAHA mTLS proxy certificate
   client.*    Lambda client certificate
 
-Cluster secret:
-  kubectl -n mhacs-verify create secret generic waha-mtls \\
-    --from-file=tls.crt=$(pwd)/server.crt --from-file=tls.key=$(pwd)/server.key \\
-    --from-file=ca.crt=$(pwd)/ca.crt --dry-run=client -o yaml | kubectl apply -f -
-  kubectl -n mhacs-verify rollout restart deployment/waha
+Store in OpenBao (Argo CD fills the waha-mtls Secret via argocd-vault-plugin):
+  bao kv put kv/k8s/mhacs-verify/waha-mtls \\
+    tls_crt=@$(pwd)/server.crt tls_key=@$(pwd)/server.key ca_crt=@$(pwd)/ca.crt
+Then Hard Refresh + sync the Argo CD app and restart deploy/waha if Reloader isn't installed.
 NEXT

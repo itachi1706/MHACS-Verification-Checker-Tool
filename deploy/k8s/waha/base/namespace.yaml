@@ -3,5 +3,5 @@ kind: Namespace
 metadata:
   name: mhacs-verify
   annotations:
-    # Deleting the namespace would also delete the hand-made secrets and the session volume.
+    # Never let Argo CD delete the namespace (and with it the session data or PVC).
     argocd.argoproj.io/sync-options: Delete=false,Prune=false

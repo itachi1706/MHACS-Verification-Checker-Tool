@@ -11,6 +11,7 @@ labels:
 
 resources:
   - namespace.yaml
+  - secrets.yaml
   - deployment.yaml
   - service.yaml
   - networkpolicy.yaml

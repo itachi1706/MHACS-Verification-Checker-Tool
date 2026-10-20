@@ -14,6 +14,9 @@ spec:
       app.kubernetes.io/component: waha
   template:
     metadata:
+      annotations:
+        # Restart when the OpenBao-backed secrets change (no-op without Stakater Reloader).
+        reloader.stakater.com/auto: "true"
       labels:
         app.kubernetes.io/component: waha
     spec:
