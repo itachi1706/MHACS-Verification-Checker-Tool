@@ -76,7 +76,10 @@ What we deliver is **Kubernetes manifests** (or a Kustomize overlay) for the clu
 WAHA Core can store the session in **Postgres or MongoDB**
 (`WHATSAPP_SESSIONS_POSTGRESQL_URL` / `WHATSAPP_SESSIONS_MONGO_URL`). Checked in the image:
 with Postgres, the GOWS engine stores **both the login and its message/chat/group store**
-in the database (otherwise it's SQLite on disk). **MySQL isn't supported.**
+in the database (otherwise it's SQLite on disk). **MySQL isn't supported**: the image
+only has SQLite, Postgres and MongoDB backends, and GOWS only accepts SQLite or Postgres.
+If the only existing DB is MySQL, use the PVC fallback. A new DO Postgres cluster (about
+US$15/month) would break the budget.
 
 | | Existing DO managed Postgres (chosen) | PVC (fallback) |
 |---|---|---|
@@ -114,7 +117,7 @@ Application in `deploy/argocd/`). Setup steps are in `deploy/k8s/waha/README.md`
 - **Session storage**: the existing DO managed Postgres (`WHATSAPP_SESSIONS_POSTGRESQL_URL`).
   Optional PVC component as a fallback.
 - **Metrics**: `WAHA_PROMETHEUS_ENABLED`. The sidecar serves only `/metrics` on port 9090
-  (monitoring namespace only), with a `ServiceMonitor`.
+  (monitoring namespace only), scraped by VictoriaMetrics via a `VMServiceScrape`.
 - **Service `waha-mtls`**: port 9443 → the sidecar only. WAHA's port 3000 isn't in the Service.
 - **NetworkPolicy**: inbound traffic only to 9443. Outbound is open (WhatsApp and the webhook
   Lambda have no fixed IPs).
@@ -264,7 +267,7 @@ the team):
 | **Groups + participants** (`GET /api/{session}/groups`, `.../participants`) | Choose the target group from a list in the template editor. Show the group's members. Map participant numbers to POCs (the basis for "only the POC can update" later). |
 | **Reply / quote** (`reply_to` on `sendText`) | Update, reminder and closing messages quote the original checklist. |
 | **Mentions** (`mentions` on `sendText`) | A **"Send reminder"** button posts the outstanding services and **@mentions** their POCs (using the POC→number mapping). POCs without a mapped number are listed by name. |
-| **Prometheus metrics** (`WAHA_PROMETHEUS_ENABLED`) | Scraped by the team's Prometheus, with Grafana dashboards and alerts on `waha_session_status` and `waha_up`. |
+| **Prometheus metrics** (`WAHA_PROMETHEUS_ENABLED`) | Scraped by the team's VictoriaMetrics (victoria-metrics-k8s-stack, `monitoring` namespace) via `VMServiceScrape`. Grafana dashboards and alerts on `waha_session_status` and `waha_up`. |
 
 **Kept in view for later:** multiple sessions (a separate test number), polls, events,
 labels. **Not used:** Chatwoot/MCP apps, S3/Postgres media storage.
@@ -374,7 +377,7 @@ The parser is a **pure function** with tests run against real reposts from the t
 | F14 | Group picker + participant list | §3.7 |
 | F15 | Updates/closing quote the original message | §3.7 |
 | F16 | POC→phone mapping + "Send reminder" with @mentions | §3.7. Numbers picked from the group's participant list |
-| F17 | Prometheus metrics + Grafana | §3.7, `deploy/k8s/waha/README.md` §10 |
+| F17 | Metrics (VictoriaMetrics) + Grafana | §3.7, `deploy/k8s/waha/README.md` §10 |
 
 ## 8. Data model (DynamoDB, single table with ElectroDB)
 
@@ -421,7 +424,7 @@ layer would change.
 /                       SST v3 monorepo (pnpm workspaces)
 ├─ sst.config.ts        Dynamo, Nextjs, Functions, Cron, SES, Secrets (no VPC)
 ├─ deploy/k8s/waha/     Kustomize base: Namespace, Deployment (WAHA + mTLS/metrics sidecar), Service, NetworkPolicy,
-│                        ServiceMonitor; components/local-sessions (PVC fallback);
+│                        VMServiceScrape; components/local-sessions (PVC fallback);
 │                        overlays: ingress-nginx (TCP 9443), cilium-gateway (TLSRoute)
 ├─ deploy/argocd/       Argo CD Application
 ├─ scripts/certs.sh     private CA / server / client cert generation + rotation
@@ -477,6 +480,6 @@ levels at this volume. **Total about US$0/month.**
 10. ~~Backups~~: covered by the managed Postgres backups.
 11. **Postgres:** can the `waha` user have `CREATEDB`, or will you pre-create the two
     databases? Is there room for about 10–20 more connections on the DB plan?
-12. **Prometheus:** is it kube-prometheus-stack (Prometheus Operator)? What namespace is it
-    in, and what `release` label does it select ServiceMonitors by?
+12. ~~Prometheus~~: victoria-metrics-k8s-stack in `monitoring`, so we use a `VMServiceScrape`.
+13. **Is the existing DO database Postgres or MySQL?** If it's MySQL only, we use the PVC.
 
