@@ -1,0 +1,8 @@
+# Exposure today: ingress-nginx forwards TCP port 9443 on the existing load balancer to
+# Service mhacs-verify/waha-mtls:9443 (Helm `tcp:` value, see deploy/k8s/waha/README.md).
+# Nothing extra is needed in this overlay.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base

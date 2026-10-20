@@ -1,0 +1,21 @@
+# Argo CD Application for WAHA. Switch `path` to overlays/cilium-gateway after the migration.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mhacs-verify-waha
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/itachi1706/MHACS-Verification-Checker-Tool.git
+    targetRevision: main
+    path: deploy/k8s/waha/overlays/ingress-nginx
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: mhacs-verify
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - PrunePropagationPolicy=foreground

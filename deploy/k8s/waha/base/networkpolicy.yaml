@@ -1,0 +1,16 @@
+# Allow inbound traffic to the mTLS proxy only. WAHA's port 3000 is unreachable from
+# other pods. Egress stays open: WhatsApp and the webhook Lambda have no fixed IPs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: waha-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: waha
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 9443
+          protocol: TCP

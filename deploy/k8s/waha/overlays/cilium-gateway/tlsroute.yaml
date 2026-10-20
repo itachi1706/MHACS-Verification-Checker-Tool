@@ -1,0 +1,18 @@
+# Requires the Gateway API experimental-channel CRDs (TLSRoute) and a TLS listener with
+# mode Passthrough on the shared Gateway (see deploy/k8s/waha/README.md).
+# Replace the Gateway name/namespace and hostname with your own.
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: waha-mtls
+spec:
+  parentRefs:
+    - name: shared-gateway
+      namespace: gateway
+      sectionName: waha-mtls
+  hostnames:
+    - waha.example.com
+  rules:
+    - backendRefs:
+        - name: waha-mtls
+          port: 9443

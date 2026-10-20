@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mhacs-verify
+  annotations:
+    # Deleting the namespace would also delete the hand-made secrets and the session volume.
+    argocd.argoproj.io/sync-options: Delete=false,Prune=false

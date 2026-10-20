@@ -1,0 +1,15 @@
+# WhatsApp session files. Losing this volume means re-linking the bot (QR / pairing code).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: waha-sessions
+  annotations:
+    # Never let Argo CD delete the session volume.
+    argocd.argoproj.io/sync-options: Delete=false,Prune=false
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 1Gi
