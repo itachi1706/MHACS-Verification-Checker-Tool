@@ -50,20 +50,22 @@ Needs `doctl` (authenticated) and `psql`.
    ```
    Or in the control panel: Databases → your cluster → Settings → Trusted sources → add the
    Kubernetes cluster.
-3. **Create the user and databases** as `doadmin`, from a machine on the trusted list (e.g.
-   your IP, temporarily) or from a pod in the cluster:
-   ```bash
-   kubectl run psql --rm -it --restart=Never --image=postgres:17-alpine -- \
-     psql "postgresql://doadmin:<doadmin-password>@<private-host>:25060/defaultdb?sslmode=require"
-   ```
-   ```sql
-   CREATE ROLE waha LOGIN PASSWORD '<openssl rand -hex 24>';
-   -- Pre-create both databases so WAHA doesn't need CREATEDB:
-   CREATE DATABASE waha_mhacs         OWNER waha;   -- main  (waha_<WAHA_NAMESPACE>)
-   CREATE DATABASE waha_mhacs_default OWNER waha;   -- session "default"
-   ```
-   As database owner, `waha` can create its tables in the `public` schema (PG 15+ makes
-   the database owner the owner of `public`).
+3. **Databases.** WAHA connects as the **shared management user** from
+   `kv/data/k8s/common/postgres` (`#user` / `#password`). There are two ways:
+   - If that user has `CREATEDB` (e.g. it's `doadmin` or was granted it), there's nothing
+     to do: WAHA creates `waha_mhacs` and `waha_mhacs_default` on first start.
+   - Otherwise, pre-create them owned by that user, as `doadmin`, from a machine on the
+     trusted list or a throwaway pod:
+     ```bash
+     kubectl run psql --rm -it --restart=Never --image=postgres:17-alpine -- \
+       psql "postgresql://doadmin:<doadmin-password>@<private-host>:25060/defaultdb?sslmode=require"
+     ```
+     ```sql
+     CREATE DATABASE waha_mhacs         OWNER <common-user>;   -- main  (waha_<WAHA_NAMESPACE>)
+     CREATE DATABASE waha_mhacs_default OWNER <common-user>;   -- session "default"
+     ```
+   As database owner, the user can create WAHA's tables in `public` (PG 15+ makes the
+   database owner the owner of `public`).
 4. **Check connection headroom.** WAHA keeps a few small pools (expect about 10–20
    connections). Find the plan's limit in the control panel (database → Overview /
    Insights), or:
@@ -73,23 +75,27 @@ Needs `doctl` (authenticated) and `psql`.
    ```
 5. **Connection string.** `base/secrets.yaml` builds it from OpenBao (§2):
    ```
-   postgres://<db_user>:<db_password>@<common host>:<common port>/waha_mhacs?sslmode=require
+   postgres://<common user>:<common password>@<common host>:<common port>/waha_mhacs?sslmode=require
    ```
    `kv/data/k8s/common/postgres#host` must be the **private** VPC hostname, and `#port` the
    direct port (25060).
    - Connect **directly** on 25060, not through a PgBouncer connection pool.
    - WAHA uses TLS but doesn't verify the server certificate (Node `rejectUnauthorized:
      false`). That's acceptable on the private VPC hostname.
-   - Use a password **without special characters** (e.g. `openssl rand -hex 24`). WAHA
-     reads the password from the URL without percent-decoding it, so a URL-encoded
-     password would fail to authenticate.
+   - **Check the shared password's characters.** WAHA reads the password from the URL
+     without percent-decoding it, and AVP can't URL-encode, so the password must only
+     contain `A–Z a–z 0–9` and `- . _ ~ ! $ & ' ( ) * + ,`. Any of `@ : / ? # [ ] ; =
+     % ^ | \ " < > { } \`` or a space would break the URL or fail authentication. If it does
+     contain them, either rotate the shared password to a safe one, or keep a dedicated
+     user just for WAHA (see §2).
 6. **After deploying, verify:**
    ```bash
    kubectl -n mhacs-verify logs deploy/waha -c waha | grep -i "postgres storage"
    # -> "Using Postgres storage for session info."
    ```
    ```sql
-   SELECT datname, count(*) FROM pg_stat_activity WHERE usename = 'waha' GROUP BY 1;
+   SELECT datname, count(*) FROM pg_stat_activity
+   WHERE datname LIKE 'waha_mhacs%' GROUP BY 1;
    ```
 
 DO's managed Postgres includes daily backups and point-in-time recovery, so the bot's
@@ -115,7 +121,7 @@ the same way as your other apps. Nothing secret is committed.
 | `waha-env` `WAHA_API_KEY` | `kv/data/k8s/mhacs-verify/waha#api_key` |
 | `waha-env` `WHATSAPP_HOOK_HMAC_KEY` | `kv/data/k8s/mhacs-verify/waha#hook_hmac_key` |
 | `waha-env` `WHATSAPP_HOOK_URL` | `kv/data/k8s/mhacs-verify/waha#hook_url` |
-| `waha-env` `WHATSAPP_SESSIONS_POSTGRESQL_URL` | built from `kv/data/k8s/mhacs-verify/waha#db_user`, `#db_password` and the shared `kv/data/k8s/common/postgres#host`, `#port` |
+| `waha-env` `WHATSAPP_SESSIONS_POSTGRESQL_URL` | built from the shared `kv/data/k8s/common/postgres` `#user`, `#password`, `#host` and `#port` (already in OpenBao) |
 | `waha-mtls` `tls.crt` / `tls.key` / `ca.crt` | `kv/data/k8s/mhacs-verify/waha-mtls#tls_crt` / `#tls_key` / `#ca_crt` |
 
 Write the values (KV v2 mounted at `kv`; the CLI path omits `/data/`):
@@ -124,9 +130,7 @@ Write the values (KV v2 mounted at `kv`; the CLI path omits `/data/`):
 bao kv put kv/k8s/mhacs-verify/waha \
   api_key="$(openssl rand -hex 32)" \
   hook_hmac_key="$(openssl rand -hex 32)" \
-  hook_url="" \
-  db_user=waha \
-  db_password="<hex password from §0.1>"
+  hook_url=""
 
 bao kv put kv/k8s/mhacs-verify/waha-mtls \
   tls_crt=@certs/server.crt \
@@ -137,11 +141,11 @@ bao kv put kv/k8s/mhacs-verify/waha-mtls \
 - **`hook_url`** stays empty (no webhooks) until the SST app is deployed. Then set it with
   `bao kv patch kv/k8s/mhacs-verify/waha hook_url=https://<webhook-lambda-url>/waha`. If
   your AVP setup rejects empty values, use a placeholder such as `https://example.invalid/waha`.
-- **Why a dedicated `waha` user:** only the host and port come from the shared
-  `k8s/common/postgres` entry. The user gets its own hex password because WAHA reads
-  the password from the URL without percent-decoding it, so a shared password with special
-  characters would fail. If the shared user's password is plain alphanumeric and it owns
-  the two databases, you can point `db_user`/`db_password` at `k8s/common/postgres` instead.
+- **Postgres credentials** reuse the shared management user in `kv/data/k8s/common/postgres`,
+  like your other apps, so nothing new needs writing for the database. Check its password
+  only uses URL-safe characters (§0.1 step 5). If it doesn't, add `db_user`/`db_password`
+  for a dedicated user under `kv/k8s/mhacs-verify/waha` and point the two placeholders in
+  `base/secrets.yaml` at them.
 - **AVP's OpenBao policy** must allow reading `kv/data/k8s/mhacs-verify/*` as well as
   `kv/data/k8s/common/*`. For example:
   ```hcl
