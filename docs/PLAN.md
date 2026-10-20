@@ -105,41 +105,66 @@ probes: GET /ping  (liveness/readiness)
 ---
 Service: ClusterIP :3000
 Ingress: waha.<domain> -> Service, TLS via cert-manager,
-         nginx.ingress.kubernetes.io/whitelist-source-range: <Lambda NAT EIP>/32
+         client-certificate (mTLS) required, path /api only; reuse the existing ingress/LB
 ```
 
 The env var names above follow WAHA's docs. We'll check them against the pinned version
 during the spike.
 
-### 3.4 Does WAHA need restrictions? **Yes, it does.**
+### 3.4 Securing WAHA without a NAT
 
-Anyone who can call the WAHA API **controls the bot's WhatsApp account**. They can read
-all its chats and groups, send messages as the bot, and log the session out. So:
+Anyone who can call the WAHA API **controls the bot's WhatsApp account**, so it must be
+locked down. Lambda has no fixed outgoing IP, and the team doesn't want a NAT. So we
+lock it down **by identity instead of by IP**. That costs nothing, and the Lambdas run
+**outside any VPC**.
 
-1. **Always (no extra cost):**
-   - TLS on the Ingress.
-   - A long random **`WAHA_API_KEY`**, so every call without it is rejected.
-   - WAHA's own dashboard and Swagger turned off.
-2. **Recommended: IP allowlist on the Ingress** so only our Lambdas can reach it. The
-   catch is that **Lambda has no fixed outgoing IP** by default. Getting one means putting
-   the Lambdas that call WAHA in a VPC behind a NAT with an Elastic IP. SST
-   `Vpc({ nat: "ec2" })` does this for about US$3–5/month. The NAT's Elastic IP is the one
-   address to allowlist on the DOKS Ingress.
-   - Without the NAT, the protection is TLS plus the API key. That's acceptable for a
-     start, but adding the allowlist later is strongly recommended.
+**Chosen: three layers, all free**
 
-**The other direction (WAHA → webhook Lambda):** DOKS sends traffic out from the
-**node IPs**, which change when the node pool is recycled or upgraded. So the webhook
-Lambda checks **WAHA's HMAC signature** instead of an IP. Allowlisting node IPs there
-would be optional and fragile.
+1. **TLS** on the Ingress (cert-manager + Let's Encrypt).
+2. **Mutual TLS (client certificate).** The Ingress rejects any connection that doesn't
+   present a client certificate signed by our own private CA. This happens before a
+   request reaches WAHA, so scanners and bots never see it. The Lambdas load the client
+   cert and key from an SST `Secret` and pass them to an `undici` `Agent`.
+   - ingress-nginx: `nginx.ingress.kubernetes.io/auth-tls-secret` +
+     `auth-tls-verify-client: "on"`. ingress-nginx was retired in March 2026, so on a
+     current cluster use whatever controller is installed. Traefik (`TLSOption`
+     `clientAuth`) and Envoy Gateway / Gateway API (`ClientTrafficPolicy`) both support
+     this.
+3. **`WAHA_API_KEY`** on every request, with WAHA's dashboard and Swagger turned off.
+
+Also: only expose `/api/*` through the Ingress. WAHA runs as non-root with no extra
+privileges, and has a NetworkPolicy limiting what it can reach.
+
+**Alternative with no inbound connections at all: Cloudflare Tunnel.** This needs a
+domain on Cloudflare. *Any* domain works, because only our Lambdas call this hostname
+(e.g. a spare domain at about US$10/year ≈ US$0.85/month; the free plan is enough).
+`cloudflared` runs in the cluster and connects out to Cloudflare, so WAHA needs no
+Ingress or open port. Lambdas authenticate with a **Cloudflare Access service token**
+(the `CF-Access-Client-Id/Secret` headers). Use this if a Cloudflare domain is available.
+It could also put Cloudflare Access in front of the web app later.
+
+**Considered and rejected:**
+- *NAT + Elastic IP for an IP allowlist:* about US$3–5/month, and not wanted.
+- *A queue relay (Lambda → SQS → relay pod polling → WAHA):* free and needs no inbound
+  connections, but synchronous calls (sending a message and getting its id back, the QR,
+  listing groups) become request/reply over queues. Too complex for what it adds.
+- *Tailscale inside Lambda:* possible, but awkward to run in Lambda.
+
+**The other direction (WAHA → webhook Lambda):** DOKS node IPs change, so the webhook
+Lambda checks **WAHA's HMAC signature** (`X-Webhook-Hmac`, SHA-512) and rejects old
+timestamps.
+
+**Watch out:** don't create a *new* `LoadBalancer` Service for WAHA. A DigitalOcean load
+balancer costs **about US$12/month**. Reuse the cluster's existing ingress controller and
+load balancer.
 
 ### 3.5 Networking
 
 ```
- Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda ─┐
-  (IP allowlist + login)                                  │ (VPC + NAT EIP, optional)
+ Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda ─┐ (no VPC)
+  (IP allowlist + login)                                  │ mTLS client cert + X-Api-Key
                                                           ▼
-                              DOKS Ingress (TLS, allowlist: NAT EIP) ──► WAHA pod + PVC
+                              DOKS Ingress (TLS, client-cert required) ──► WAHA pod + PVC
                                                                            │    ▲
  WhatsApp ◄──────────────────────── linked device ─────────────────────────┘    │
                                                                                 │
@@ -148,8 +173,29 @@ would be optional and fragile.
        └──► DynamoDB      Health-check cron Lambda ──► WAHA /api/sessions ──► SES alert
 ```
 
-If the Lambdas run inside a VPC, add a free **DynamoDB gateway endpoint**. SES goes out
-through the NAT.
+No VPC, NAT or VPC endpoints. The Lambdas reach DynamoDB, SES and WAHA over the public
+AWS and HTTPS endpoints.
+
+### 3.6 Why not ECS (or EC2) for WAHA? Cost comparison
+
+ap-southeast-1 list prices (approximate), 24/7 for about 730 hours/month:
+
+| Option | Compute | Public IPv4 (US$0.005/h) | Storage | **≈ Monthly** |
+|---|---|---|---|---|
+| **DOKS (existing cluster)** | spare capacity | uses the existing LB | PVC ≈ US$0.20 | **≈ US$0.20** |
+| Fargate, 0.25 vCPU / 0.5 GB, ARM, on-demand | ≈ US$7 | ≈ US$3.65 | EFS ≈ US$0.30 | ≈ US$11 |
+| Fargate Spot, ARM | ≈ US$2–3 (can be interrupted, then reconnects) | ≈ US$3.65 | EFS ≈ US$0.30 | ≈ US$6–7 |
+| EC2 t4g.nano + Docker | ≈ US$3.1 | ≈ US$3.65 | EBS 2 GB ≈ US$0.20 | ≈ US$7 |
+| EC2 inside AWS free-tier credits | US$0 while credits last | counts against credits | — | US$0, temporary |
+
+On AWS, WAHA needs outbound internet. Without a NAT, that means a **public IPv4 address,
+which alone costs about US$3.65/month**, so no always-on AWS option comes in under US$5.
+(An IPv6-only task would avoid that charge, but it's newer and riskier. Not worth it here.)
+Inside a VPC on AWS, the Lambdas could reach WAHA privately, but the Lambdas that also
+need SES would need a NAT or an SES interface endpoint (about US$7+/month), which brings
+the cost straight back.
+
+→ **Keep WAHA on DOKS.** It's the only option that is free or nearly free.
 
 ## 4. Restricting access to the web app
 
@@ -279,7 +325,8 @@ layer would change.
 | Unknown services | Pending suggestion for an admin to approve in the web app |
 | Hosting | AWS: SST + OpenNext on Lambda. WAHA on the existing **DigitalOcean Kubernetes** cluster, using the official image plus manifests (see §3). |
 | WAHA storage | No database. One 1–2 GiB PVC for session files (see §3.2). |
-| WAHA access | TLS + API key always. Ingress allowlist set to the Lambda NAT Elastic IP (recommended). Webhooks verified by HMAC. |
+| WAHA access | No NAT. TLS + **mTLS client cert** + API key (free). Cloudflare Tunnel + Access service token if a Cloudflare domain is available. Webhooks verified by HMAC. |
+| Budget | Free, or under US$5/month. Not for public use. |
 | Alerts | Email via SES |
 | Access | Cloudflare Access if feasible (see §4), otherwise an IP allowlist from env vars, plus app login |
 | Language | TypeScript throughout. WAHA is a REST API, so Python adds nothing. TS types come from WAHA's OpenAPI spec. |
@@ -288,7 +335,7 @@ layer would change.
 
 ```
 /                       SST v3 monorepo (pnpm workspaces)
-├─ sst.config.ts        Vpc (+NAT EIP), Dynamo, Nextjs, Functions, Cron, SES
+├─ sst.config.ts        Dynamo, Nextjs, Functions, Cron, SES, Secrets (no VPC)
 ├─ deploy/k8s/waha/     Namespace, Secret (template), PVC, Deployment, Service, Ingress (Kustomize)
 ├─ packages/
 │  ├─ core/             domain logic: parser, renderer, entities, WAHA client (pure TS + tests)
@@ -302,16 +349,16 @@ layer would change.
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0: Spike** | Run WAHA locally in Docker and link the Business number. Send to the test group. Record real webhook payloads and reposts. Choose the engine (**GOWS** or **NOWEB**: no Chromium, low memory) and check the needed features work in the free *Core* tier (one session is enough). | Sending, receiving, deleting and session-status events all work |
-| **1: Foundations** | WAHA manifests deployed to DOKS (PVC, Ingress, TLS, API key). SST infra (VPC + NAT EIP, DynamoDB, Next.js). IP allowlists on both sides. Admin login. | The admin app is reachable only from allowed IPs. WAHA is reachable only from the NAT EIP. Pod restarts don't log the bot out. |
+| **1: Foundations** | WAHA manifests deployed to DOKS (PVC, Ingress with TLS + mTLS, API key). Private CA and client cert. SST infra (DynamoDB, Next.js, Secrets). Web app IP allowlist. Admin login. | The admin app is reachable only from allowed IPs. WAHA rejects requests without the client cert. Pod restarts don't log the bot out. |
 | **2: MVP sending** | Services, groups and templates CRUD. Wizard, preview, send. Manual grid, send update, close, delete message. | A full verification can be run by hand |
 | **3: Auto-parsing** | Webhook, parser (with tests from real reposts), audit feed, suggestions | Reposts in the test group update the grid by themselves |
 | **4: Ops** | Session alerts (SES), health cron, QR/pairing page, backups (DynamoDB PITR) | A forced logout produces an email within 10 minutes |
 | **5: Go-live** | Switch the template's target to the real group | — |
 
 Rough added running cost: WAHA uses spare capacity on the existing DOKS cluster, plus about
-US$0.20 for the PVC. The optional NAT instance with a fixed Elastic IP is about US$3–5.
-Lambda, DynamoDB, CloudFront and SES are about free at this volume. **Total about
-US$0–5/month.**
+US$0.20 for the PVC (plus about US$0.85 if a spare Cloudflare domain is bought for the
+Tunnel option). Lambda, DynamoDB, CloudFront and SES are within or about at free-tier
+levels at this volume. **Total about US$0.20–1/month.**
 
 ## 12. Future enhancements
 
