@@ -64,6 +64,9 @@ Needs `doctl` (authenticated) and `psql`.
      CREATE DATABASE waha_mhacs         OWNER <common-user>;   -- main  (waha_<WAHA_NAMESPACE>)
      CREATE DATABASE waha_mhacs_default OWNER <common-user>;   -- session "default"
      ```
+     If `CREATE DATABASE ... OWNER` fails with *must be able to SET ROLE*, run
+     `GRANT <common-user> TO doadmin;` first, then retry.
+     Check with `\l waha_mhacs*`: both should show `<common-user>` as owner.
    As database owner, the user can create WAHA's tables in `public` (PG 15+ makes the
    database owner the owner of `public`).
 4. **Check connection headroom.** WAHA keeps a few small pools (expect about 10–20
