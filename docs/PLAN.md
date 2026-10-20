@@ -80,40 +80,43 @@ What we deliver is **Kubernetes manifests** (or a Kustomize overlay) for the clu
   volume, every pod restart logs the bot out and needs a new QR scan.
 - → **PVC of 1–2 GiB** (`ReadWriteOnce`, `do-block-storage`), mounted at the sessions path
   (`/app/.sessions`). Add `/app/.media` only if we ever handle media.
-- Saving sessions to Postgres/MongoDB is a WAHA *Plus* (paid) feature. We don't need it.
+- WAHA can also save sessions to Postgres/MongoDB (`WHATSAPP_SESSIONS_POSTGRESQL_URL` / `_MONGO_URL`). We don't need that: a PVC is simpler and free.
 - Our own app data (verifications, statuses, audit) lives in **DynamoDB**, not in WAHA.
 - DO block storage costs about US$0.10/GiB/month, so **about US$0.20/month**.
 
 ### 3.3 Kubernetes shape
 
-```yaml
-# Deployment: waha (namespace: mhacs-verify)
-replicas: 1                 # exactly one; two pods would fight over the same WhatsApp session
-strategy: { type: Recreate } # old pod stops before the new one starts (RWO volume, single session)
-image: devlikeapro/waha:<pinned-version>
-env:
-  WHATSAPP_DEFAULT_ENGINE: GOWS       # or NOWEB; no Chromium, ~200–400 MB RAM
-  WAHA_API_KEY:          <from Secret>   # required on every API call (X-Api-Key)
-  WHATSAPP_HOOK_URL:     https://<webhook-lambda-url>/waha
-  WHATSAPP_HOOK_EVENTS:  message,session.status
-  WHATSAPP_HOOK_HMAC_KEY: <from Secret>  # webhook body signed, Lambda verifies
-  WAHA_DASHBOARD_ENABLED: "false"     # admin UI lives in our web app instead
-  WHATSAPP_SWAGGER_ENABLED: "false"
-volumeMounts: /app/.sessions -> PVC waha-sessions (1Gi)
-resources: requests 100m / 384Mi, limits 500m / 768Mi
-probes: GET /ping  (liveness/readiness)
----
-# Sidecar in the same pod: mtls-proxy (nginx-unprivileged, pinned)
-listens :8443 TLS; ssl_verify_client on (our private CA); only /api/* -> http://127.0.0.1:3000
----
-Service: ClusterIP, port 8443 -> mtls-proxy only (WAHA's :3000 is never exposed)
-Route: TLS passthrough on SNI waha.<route53-domain> -> Service :8443
-       (ingress-nginx: ssl-passthrough Ingress; Cilium: TLSRoute on the shared Gateway)
-NetworkPolicy (CiliumNetworkPolicy): ingress only to :8443; egress to DNS + internet for WhatsApp/webhooks
-```
+The manifests are in **`deploy/k8s/waha/`** (Kustomize base + overlays, plus an Argo CD
+Application in `deploy/argocd/`). Setup steps are in `deploy/k8s/waha/README.md`. Summary:
 
-The env var names above follow WAHA's docs. We'll check them against the pinned version
-during the spike.
+- **Deployment `waha`**: 1 replica with `Recreate` strategy (one WhatsApp session can't be
+  shared between pods).
+  - Image `devlikeapro/waha:gows-2026.9.2` (Core, GOWS engine), with the session
+    auto-started.
+  - Dashboard and Swagger off. Runs as non-root.
+  - Sidecar `mtls-proxy` (`nginxinc/nginx-unprivileged:1.30.6-alpine`, read-only root
+    filesystem).
+- **PVC `waha-sessions`**: 1 GiB, `do-block-storage`, protected from Argo CD prune/delete.
+- **Service `waha-mtls`**: port 9443 → the sidecar only. WAHA's port 3000 isn't in the Service.
+- **NetworkPolicy**: inbound traffic only to 9443. Outbound is open (WhatsApp and the webhook
+  Lambda have no fixed IPs).
+- **Secrets, created by hand and not in git**:
+  - `waha-env`: `WAHA_API_KEY`, `WHATSAPP_HOOK_HMAC_KEY`, `WHATSAPP_HOOK_URL`.
+  - `waha-mtls`: server cert/key + CA.
+
+**Checked against the actual image** (`gows-2026.9.2`, published 2026-10-02):
+- The env var names in the manifests exist in the image.
+- The API key is read from `WAHA_API_KEY` or `WHATSAPP_API_KEY`; the entrypoint hashes it
+  with SHA-512.
+- Session files default to `./.sessions` (`/app/.sessions`).
+- Webhooks are signed with `X-Webhook-Hmac` (SHA-512 of the body), and also carry
+  `X-Webhook-Timestamp` and `X-Webhook-Request-Id`. Only the body is signed, so the Lambda
+  checks the `timestamp` field *inside* the signed body to reject replays, and dedupes by
+  message id.
+
+**WAHA Core vs Plus:** most former Plus features are now in Core. We checked the image:
+the Core build only blocks *API-key management* (multiple keys) and image/voice/video
+*status* posts. We need neither, so **Core (free) is enough**.
 
 ### 3.4 Securing WAHA without a NAT
 
@@ -138,8 +141,9 @@ through the migration. Only one routing object changes.
      that CA).
    - It requires a **client cert** signed by the same CA (`ssl_verify_client on`).
    - It forwards only `/api/*` to WAHA on `127.0.0.1:3000`.
-   - Connections without the client cert are dropped during the TLS handshake, so
-     scanners never reach WAHA.
+   - Requests without a valid client cert are rejected by nginx (HTTP 400) and never
+     reach WAHA. Tested locally: no cert → 400, cert from another CA → 400, valid cert
+     → forwarded, non-`/api` path → 404.
    - The Lambdas keep the CA cert, client cert and key in SST `Secret`s and pass them to
      an `undici` `Agent` (`ca`, `cert`, `key`).
 2. **`WAHA_API_KEY`** on every request, with WAHA's dashboard and Swagger turned off.
@@ -151,9 +155,9 @@ through the migration. Only one routing object changes.
 
 | | Today: ingress-nginx | Later: Cilium Gateway |
 |---|---|---|
-| Object | `Ingress` with `nginx.ingress.kubernetes.io/ssl-passthrough: "true"` and `backend-protocol: HTTPS` | `TLSRoute` (Gateway API) on a `TLS` listener with `mode: Passthrough` and `hostname: waha.<domain>` |
-| Requirement | The controller must run with `--enable-ssl-passthrough`. Check whether it already does; if not, adding the flag is a one-line Helm value. | TLSRoute is an *experimental-channel* CRD. Install the experimental Gateway API CRDs that match the Cilium version, and add the listener to the **existing shared Gateway** (a new Gateway creates a new DO LB, about US$12/month). |
-| Fallback | Native `auth-tls-*` annotations at the edge (also works, but has to be redone after the migration) | When Cilium ships GEP-91, mTLS *could* move to the edge, but nothing has to change |
+| Object | **TCP stream** on port 9443 via the controller's existing `--tcp-services-configmap` (Helm value `tcp: {"9443": "mhacs-verify/waha-mtls:9443"}`) | `TLSRoute` (Gateway API) on a `TLS` listener, port 9443, `mode: Passthrough`, `hostname: waha.<domain>` |
+| Requirement | One Helm value. It adds port 9443 to the **existing** DO load balancer at no cost. `--enable-ssl-passthrough` is *not* needed (it would send all 443 traffic through an extra proxy). | TLSRoute is an *experimental-channel* CRD. Install the experimental Gateway API CRDs that match the Cilium version, and add the listener to the **existing shared Gateway** (a new Gateway creates a new DO LB, about US$12/month). |
+| Fallback | `--enable-ssl-passthrough` + an Ingress, or the native `auth-tls-*` annotations | When Cilium ships GEP-91, mTLS *could* move to the edge, but nothing has to change |
 
 **DNS:** just an `A`/`CNAME` record such as `waha.<your-route53-domain>` → the existing
 load balancer IP. No Cloudflare needed. It's machine-to-machine only, so the name can
@@ -381,7 +385,7 @@ layer would change.
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0: Spike** | Run WAHA locally in Docker and link the Business number. Send to the test group. Record real webhook payloads and reposts. Choose the engine (**GOWS** or **NOWEB**: no Chromium, low memory) and check the needed features work in the free *Core* tier (one session is enough). | Sending, receiving, deleting and session-status events all work |
+| **0: Spike** | Deploy `deploy/k8s/waha` to DOKS via Argo CD and link the Business number. Send to the test group. Record real webhook payloads and reposts. Confirm WAHA runs fine as non-root (uid 1000) with the PVC. | Sending, receiving, deleting and session-status events work through the mTLS endpoint |
 | **1: Foundations** | WAHA + mTLS sidecar deployed to DOKS (PVC, passthrough route, NetworkPolicy, API key). Private CA and server/client certs. SST infra (DynamoDB, Next.js, Secrets). Web app IP allowlist. Admin login. | The admin app is reachable only from allowed IPs. WAHA rejects requests without the client cert. Pod restarts don't log the bot out. |
 | **2: MVP sending** | Services, groups and templates CRUD. Wizard, preview, send. Manual grid, send update, close, delete message. | A full verification can be run by hand |
 | **3: Auto-parsing** | Webhook, parser (with tests from real reposts), audit feed, suggestions | Reposts in the test group update the grid by themselves |
@@ -401,3 +405,25 @@ levels at this volume. **Total about US$0.20–1/month.**
 - Accept quoted replies and emoji reactions as status updates.
 - CSV/PDF export of a closed verification.
 - Cloudflare Access, if a suitable Cloudflare zone becomes available.
+
+## 13. Open questions (round 3)
+
+1. **ingress-nginx Service annotations:** is PROXY protocol enabled on the DO load balancer?
+   Is `do-loadbalancer-protocol` set? This decides the exact `tcp:` value (see the deploy README).
+2. **Secrets in the cluster:** create them by hand with `kubectl` (current default), or do you
+   use Sealed Secrets / External Secrets? AWS SSM Parameter Store standard tier is free; AWS
+   Secrets Manager is about US$0.40 per secret per month.
+3. **Repo visibility:** is the repo private? Argo CD then needs a read-only token.
+4. **WAHA hostname:** which Route 53 subdomain (e.g. `waha.<domain>`)?
+5. **Cluster capacity and architecture:** WAHA needs about 256–768 MiB RAM. Are the nodes
+   amd64? (`gows-*` is amd64; `gows-arm-*` exists for arm64.)
+6. **Phone:** who holds the bot phone? WhatsApp unlinks devices if the phone is offline for
+   about 14 days.
+7. **SES:** which region? Will alerts go only to a few verified admin addresses (SES sandbox
+   is fine), or do we need SES production access?
+8. **Web app login:** who are the admins, and how should they sign in (email magic link via
+   SES, or Google/Microsoft SSO)?
+9. **One open verification per group at a time?** (Assumed yes.)
+10. **Backups:** losing the PVC only means re-linking the bot, so no volume snapshots are
+    planned (they would cost extra). OK?
+
