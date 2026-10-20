@@ -417,6 +417,7 @@ layer would change.
 | Budget | Free, or under US$5/month. Not for public use. |
 | Alerts | Email via SES |
 | Cluster secrets | OpenBao, filled into the manifests by argocd-vault-plugin at render time |
+| WAHA DB credentials | The shared management user and host from `kv/data/k8s/common/postgres` |
 | Access | Cloudflare Access if feasible (see §4), otherwise an IP allowlist from env vars, plus app login |
 | Language | TypeScript throughout. WAHA is a REST API, so Python adds nothing. TS types come from WAHA's OpenAPI spec. |
 
@@ -478,8 +479,10 @@ levels at this volume. **Total about US$0/month.**
    SES, or Google/Microsoft SSO)?
 9. **One open verification per group at a time?** (Assumed yes.)
 10. ~~Backups~~: covered by the managed Postgres backups.
-11. **Postgres:** can the `waha` user have `CREATEDB`, or will you pre-create the two
-    databases? Is there room for about 10–20 more connections on the DB plan?
+11. **Postgres:** WAHA reuses the shared management user from
+    `kv/data/k8s/common/postgres` (decided by the team). Still to confirm: does it have
+    `CREATEDB` (otherwise pre-create `waha_mhacs` and `waha_mhacs_default`)? Is its password
+    URL-safe? Is there room for about 10–20 more connections?
 12. ~~Prometheus~~: victoria-metrics-k8s-stack in `monitoring`, so we use a `VMServiceScrape`.
 13. ~~Postgres or MySQL~~: the team has an existing DO managed Postgres, so we use it.
 
