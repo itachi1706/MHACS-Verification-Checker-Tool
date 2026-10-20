@@ -14,7 +14,7 @@ resources:
   - deployment.yaml
   - service.yaml
   - networkpolicy.yaml
-  - servicemonitor.yaml
+  - vmservicescrape.yaml
 
 configMapGenerator:
   - name: waha-mtls-proxy

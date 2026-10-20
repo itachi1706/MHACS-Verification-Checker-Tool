@@ -1,0 +1,14 @@
+# VictoriaMetrics operator scrape config (victoria-metrics-k8s-stack). The stack's VMAgent
+# selects all VMServiceScrapes cluster-wide by default.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: waha
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: waha
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

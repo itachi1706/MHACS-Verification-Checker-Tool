@@ -7,7 +7,7 @@ by Argo CD with Kustomize.
 deploy/
 ├─ argocd/waha.yaml                   Argo CD Application
 └─ k8s/waha/
-   ├─ base/                           Namespace, Deployment (WAHA + mtls-proxy), Service, NetworkPolicy, ServiceMonitor
+   ├─ base/                           Namespace, Deployment (WAHA + mtls-proxy), Service, NetworkPolicy, VMServiceScrape
    ├─ components/local-sessions/      optional: sessions on a PVC instead of Postgres
    └─ overlays/
       ├─ ingress-nginx/               today: TCP 9443 via ingress-nginx tcp-services
@@ -19,37 +19,79 @@ How a request travels: Lambda → `https://waha.<domain>:9443` → DO load balan
 (checks the client certificate, allows only `/api/*`) → WAHA on `127.0.0.1:3000`.
 TLS always terminates in the pod, so the edge never needs to support client certificates.
 
-## 0. Postgres (session storage)
+## 0. Session storage: Postgres
 
-WAHA Core stores the WhatsApp session and the GOWS message store (used for history catch-up)
-in your existing **DigitalOcean managed Postgres**. MySQL isn't supported, only Postgres
-and MongoDB.
+WAHA Core stores the WhatsApp login and the GOWS message store (used for history catch-up)
+in **Postgres**. WAHA has no MySQL support: in the image, the only storage backends are
+local SQLite files, Postgres and MongoDB, and the GOWS engine only accepts SQLite or
+Postgres.
 
-WAHA creates and uses two databases: `waha_mhacs` (main) and `waha_mhacs_default` (the
-`default` session). Create a dedicated user, then either give it `CREATEDB` or create the
-databases yourself (WAHA checks whether they exist before creating them):
+**Which option:**
+- **You already have a DO managed Postgres cluster** → use it (steps below). US$0 extra.
+- **Your existing DB is MySQL only** → **don't** create a Postgres cluster just for this
+  (the smallest DO managed Postgres is about US$15/month, over budget). Use the PVC instead:
+  enable `components/local-sessions` in the overlay and leave out
+  `WHATSAPP_SESSIONS_POSTGRESQL_URL`. That costs about US$0.10/month. You lose backups,
+  but losing the volume only means re-linking the bot.
 
-```sql
-CREATE USER waha WITH PASSWORD '<strong-password>';
--- either:
-ALTER USER waha CREATEDB;
--- or:
-CREATE DATABASE waha_mhacs OWNER waha;
-CREATE DATABASE waha_mhacs_default OWNER waha;
-```
+### 0.1 Configure DO managed Postgres
 
-- Connect **directly** (the private VPC hostname, port 25060), not through a PgBouncer
-  pool, because WAHA runs `CREATE DATABASE` and keeps its own connection pools.
-- Add the DOKS cluster to the database's **Trusted sources**.
-- WAHA uses TLS (`sslmode=require`) but doesn't verify the server certificate. That's
-  acceptable inside the VPC.
-- Plan for roughly 10–20 connections. Check that the database plan has room for them.
+Needs `doctl` (authenticated) and `psql`.
 
-The URL's database part is just the main connection WAHA logs in to (DO's default is `defaultdb`):
-`postgres://waha:<password>@private-<db-host>:25060/defaultdb?sslmode=require`
+1. **Find the cluster and its private connection details**
+   ```bash
+   doctl databases list                                   # note the ID (engine: pg)
+   doctl databases connection <db-id> --private           # private host, port 25060, doadmin password
+   ```
+2. **Allow the Kubernetes cluster** (Trusted sources)
+   ```bash
+   doctl kubernetes cluster list                          # note the cluster ID
+   doctl databases firewalls append <db-id> --rule k8s:<cluster-id>
+   ```
+   Or in the control panel: Databases → your cluster → Settings → Trusted sources → add the
+   Kubernetes cluster.
+3. **Create the user and databases** as `doadmin`, from a machine on the trusted list (e.g.
+   your IP, temporarily) or from a pod in the cluster:
+   ```bash
+   kubectl run psql --rm -it --restart=Never --image=postgres:17-alpine -- \
+     psql "postgresql://doadmin:<doadmin-password>@<private-host>:25060/defaultdb?sslmode=require"
+   ```
+   ```sql
+   CREATE ROLE waha LOGIN PASSWORD '<openssl rand -hex 24>';
+   -- Pre-create both databases so WAHA doesn't need CREATEDB:
+   CREATE DATABASE waha_mhacs         OWNER waha;   -- main  (waha_<WAHA_NAMESPACE>)
+   CREATE DATABASE waha_mhacs_default OWNER waha;   -- session "default"
+   ```
+   As database owner, `waha` can create its tables in the `public` schema (PG 15+ makes
+   the database owner the owner of `public`).
+4. **Check connection headroom.** WAHA keeps a few small pools (expect about 10–20
+   connections). Find the plan's limit in the control panel (database → Overview /
+   Insights), or:
+   ```sql
+   SHOW max_connections;
+   SELECT count(*) FROM pg_stat_activity;
+   ```
+5. **Connection string for the `waha-env` secret** (step 2):
+   ```
+   postgres://waha:<strong-password>@<private-host>:25060/waha_mhacs?sslmode=require
+   ```
+   - Connect **directly** on 25060, not through a PgBouncer connection pool.
+   - WAHA uses TLS but doesn't verify the server certificate (Node `rejectUnauthorized:
+     false`). That's acceptable on the private VPC hostname.
+   - Use a password **without special characters** (e.g. `openssl rand -hex 24`). WAHA
+     reads the password from the URL without percent-decoding it, so a URL-encoded
+     password would fail to authenticate.
+6. **After deploying, verify:**
+   ```bash
+   kubectl -n mhacs-verify logs deploy/waha -c waha | grep -i "postgres storage"
+   # -> "Using Postgres storage for session info."
+   ```
+   ```sql
+   SELECT datname, count(*) FROM pg_stat_activity WHERE usename = 'waha' GROUP BY 1;
+   ```
 
-To use a disk volume instead, enable `components/local-sessions` in the overlay and leave
-out `WHATSAPP_SESSIONS_POSTGRESQL_URL`.
+DO's managed Postgres includes daily backups and point-in-time recovery, so the bot's
+login is backed up too.
 
 ## 1. Certificates
 
@@ -127,7 +169,7 @@ kubectl apply -f deploy/argocd/waha.yaml
   namespace `mhacs-verify`, and the cluster-scoped `Namespace` kind.
 - The namespace (and the PVC, if you use `local-sessions`) is annotated
   `Prune=false,Delete=false`, so Argo CD never removes the hand-made secrets or the session.
-- `base/servicemonitor.yaml` needs the Prometheus Operator CRDs. See section 10.
+- `base/vmservicescrape.yaml` needs the VictoriaMetrics operator CRDs. See section 10.
 
 ## 6. Link the WhatsApp Business number
 
@@ -199,23 +241,22 @@ kubectl -n mhacs-verify rollout restart deployment/waha
 
 Then update the client cert in SST (`sst secret set ...`).
 
-## 10. Prometheus / Grafana
+## 10. Metrics (VictoriaMetrics) / Grafana
 
 `WAHA_PROMETHEUS_ENABLED=True` turns on WAHA's `/metrics`. The sidecar serves only that
 path, on plain HTTP port **9090** (Service port `metrics`). The NetworkPolicy allows 9090
-only from the `monitoring` namespace.
+only from the `monitoring` namespace, where VMAgent runs.
 
-- **Prometheus Operator** (kube-prometheus-stack): `base/servicemonitor.yaml` is picked up
-  if your Prometheus selects it. The kube-prometheus-stack default only selects
-  ServiceMonitors labelled `release: <helm-release>`, unless
-  `serviceMonitorSelectorNilUsesHelmValues: false` is set.
-- **Plain Prometheus** (no Operator): delete `servicemonitor.yaml` from the base
-  `kustomization.yaml` and add a scrape job for `waha-mtls.mhacs-verify.svc:9090`.
-- If Prometheus runs in a namespace other than `monitoring`, change the
-  `namespaceSelector` in `base/networkpolicy.yaml`.
-
-Useful metrics: `waha_session_status`, `waha_session_activity_timestamp_seconds`,
-`waha_messages_total`, `waha_events_total`, `waha_up`. Alert when the session isn't
-`WORKING` or the pod keeps restarting. The
-SES email alert covers the first one too, so Grafana alerting is optional.
-
+- `base/vmservicescrape.yaml` is a native **VMServiceScrape**. victoria-metrics-k8s-stack's
+  VMAgent selects all VMServiceScrapes by default (`selectAllByDefault: true`), so no label
+  is needed.
+  - If you've turned that off, add the label your VMAgent's `serviceScrapeSelector`
+    expects.
+  - (A Prometheus `ServiceMonitor` would also work through the operator's converter. The
+    native resource just avoids depending on it.)
+- In Grafana (VictoriaMetrics datasource) the metrics are prefixed `waha_`:
+  `waha_up`, `waha_session_status`, `waha_session_activity_timestamp_seconds`,
+  `waha_messages_total`, `waha_events_total`, `waha_http_requests_total`.
+- Suggested alerts (VMRule): `waha_up == 0` for 5m; session not `WORKING` for 10m; pod
+  restarts. The SES email alert from the app also covers a disconnected session.
+- Check the scrape: VMAgent UI → *Targets* → `serviceScrape/mhacs-verify/waha`.
