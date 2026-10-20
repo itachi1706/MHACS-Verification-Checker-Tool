@@ -409,7 +409,7 @@ layer would change.
 | Who can update | Anyone in the group, for now |
 | Unknown services | Pending suggestion for an admin to approve in the web app |
 | Hosting | AWS: SST + OpenNext on Lambda. WAHA on the existing **DigitalOcean Kubernetes** cluster, using the official image plus manifests (see §3). |
-| WAHA storage | Existing DO managed **Postgres** (sessions + GOWS store). PVC kept as a fallback component (see §3.2). |
+| WAHA storage | Existing DO managed **Postgres** (confirmed available; MySQL isn't supported by WAHA). Sessions + GOWS store. PVC kept as a fallback component (see §3.2). |
 | First-version extras | History catch-up, 👍 reactions, group picker, quoted replies, @mention reminders, Prometheus metrics (see §3.7) |
 | Kept for later | Multiple sessions, polls, events, labels |
 | WAHA access | No NAT, no Cloudflare. **mTLS handled by a sidecar in the WAHA pod** (private CA) + API key + NetworkPolicy. The edge only does TLS passthrough (ingress-nginx now, Cilium `TLSRoute` later). Webhooks verified by HMAC. |
@@ -481,5 +481,5 @@ levels at this volume. **Total about US$0/month.**
 11. **Postgres:** can the `waha` user have `CREATEDB`, or will you pre-create the two
     databases? Is there room for about 10–20 more connections on the DB plan?
 12. ~~Prometheus~~: victoria-metrics-k8s-stack in `monitoring`, so we use a `VMServiceScrape`.
-13. **Is the existing DO database Postgres or MySQL?** If it's MySQL only, we use the PVC.
+13. ~~Postgres or MySQL~~: the team has an existing DO managed Postgres, so we use it.
 
