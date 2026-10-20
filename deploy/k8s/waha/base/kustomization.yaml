@@ -11,10 +11,10 @@ labels:
 
 resources:
   - namespace.yaml
-  - pvc.yaml
   - deployment.yaml
   - service.yaml
   - networkpolicy.yaml
+  - servicemonitor.yaml
 
 configMapGenerator:
   - name: waha-mtls-proxy

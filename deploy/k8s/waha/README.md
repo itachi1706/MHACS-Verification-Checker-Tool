@@ -7,7 +7,8 @@ by Argo CD with Kustomize.
 deploy/
 ├─ argocd/waha.yaml                   Argo CD Application
 └─ k8s/waha/
-   ├─ base/                           Namespace, PVC, Deployment (WAHA + mtls-proxy), Service, NetworkPolicy
+   ├─ base/                           Namespace, Deployment (WAHA + mtls-proxy), Service, NetworkPolicy, ServiceMonitor
+   ├─ components/local-sessions/      optional: sessions on a PVC instead of Postgres
    └─ overlays/
       ├─ ingress-nginx/               today: TCP 9443 via ingress-nginx tcp-services
       └─ cilium-gateway/              later: TLSRoute (TLS passthrough) on the shared Gateway
@@ -17,6 +18,38 @@ How a request travels: Lambda → `https://waha.<domain>:9443` → DO load balan
 → ingress-nginx TCP stream, or a Cilium Gateway TLS passthrough listener → `mtls-proxy`
 (checks the client certificate, allows only `/api/*`) → WAHA on `127.0.0.1:3000`.
 TLS always terminates in the pod, so the edge never needs to support client certificates.
+
+## 0. Postgres (session storage)
+
+WAHA Core stores the WhatsApp session and the GOWS message store (used for history catch-up)
+in your existing **DigitalOcean managed Postgres**. MySQL isn't supported, only Postgres
+and MongoDB.
+
+WAHA creates and uses two databases: `waha_mhacs` (main) and `waha_mhacs_default` (the
+`default` session). Create a dedicated user, then either give it `CREATEDB` or create the
+databases yourself (WAHA checks whether they exist before creating them):
+
+```sql
+CREATE USER waha WITH PASSWORD '<strong-password>';
+-- either:
+ALTER USER waha CREATEDB;
+-- or:
+CREATE DATABASE waha_mhacs OWNER waha;
+CREATE DATABASE waha_mhacs_default OWNER waha;
+```
+
+- Connect **directly** (the private VPC hostname, port 25060), not through a PgBouncer
+  pool, because WAHA runs `CREATE DATABASE` and keeps its own connection pools.
+- Add the DOKS cluster to the database's **Trusted sources**.
+- WAHA uses TLS (`sslmode=require`) but doesn't verify the server certificate. That's
+  acceptable inside the VPC.
+- Plan for roughly 10–20 connections. Check that the database plan has room for them.
+
+The URL's database part is just the main connection WAHA logs in to (DO's default is `defaultdb`):
+`postgres://waha:<password>@private-<db-host>:25060/defaultdb?sslmode=require`
+
+To use a disk volume instead, enable `components/local-sessions` in the overlay and leave
+out `WHATSAPP_SESSIONS_POSTGRESQL_URL`.
 
 ## 1. Certificates
 
@@ -39,7 +72,8 @@ kubectl -n mhacs-verify create secret generic waha-mtls \
 
 kubectl -n mhacs-verify create secret generic waha-env \
   --from-literal=WAHA_API_KEY="$(openssl rand -hex 32)" \
-  --from-literal=WHATSAPP_HOOK_HMAC_KEY="$(openssl rand -hex 32)"
+  --from-literal=WHATSAPP_HOOK_HMAC_KEY="$(openssl rand -hex 32)" \
+  --from-literal=WHATSAPP_SESSIONS_POSTGRESQL_URL='postgres://waha:<password>@private-<db-host>:25060/defaultdb?sslmode=require'
 # Add WHATSAPP_HOOK_URL=https://<webhook-lambda-url>/waha once the SST app is deployed.
 ```
 
@@ -91,8 +125,9 @@ kubectl apply -f deploy/argocd/waha.yaml
   --username <user> --password <fine-grained PAT with read-only Contents>`).
 - Uses `project: default`. Change it if you restrict projects. The project must allow
   namespace `mhacs-verify`, and the cluster-scoped `Namespace` kind.
-- The PVC is annotated `Prune=false,Delete=false`, so Argo CD never removes the WhatsApp
-  session.
+- The namespace (and the PVC, if you use `local-sessions`) is annotated
+  `Prune=false,Delete=false`, so Argo CD never removes the hand-made secrets or the session.
+- `base/servicemonitor.yaml` needs the Prometheus Operator CRDs. See section 10.
 
 ## 6. Link the WhatsApp Business number
 
@@ -163,3 +198,24 @@ kubectl -n mhacs-verify rollout restart deployment/waha
 ```
 
 Then update the client cert in SST (`sst secret set ...`).
+
+## 10. Prometheus / Grafana
+
+`WAHA_PROMETHEUS_ENABLED=True` turns on WAHA's `/metrics`. The sidecar serves only that
+path, on plain HTTP port **9090** (Service port `metrics`). The NetworkPolicy allows 9090
+only from the `monitoring` namespace.
+
+- **Prometheus Operator** (kube-prometheus-stack): `base/servicemonitor.yaml` is picked up
+  if your Prometheus selects it. The kube-prometheus-stack default only selects
+  ServiceMonitors labelled `release: <helm-release>`, unless
+  `serviceMonitorSelectorNilUsesHelmValues: false` is set.
+- **Plain Prometheus** (no Operator): delete `servicemonitor.yaml` from the base
+  `kustomization.yaml` and add a scrape job for `waha-mtls.mhacs-verify.svc:9090`.
+- If Prometheus runs in a namespace other than `monitoring`, change the
+  `namespaceSelector` in `base/networkpolicy.yaml`.
+
+Useful metrics: `waha_session_status`, `waha_session_activity_timestamp_seconds`,
+`waha_messages_total`, `waha_events_total`, `waha_up`. Alert when the session isn't
+`WORKING` or the pod keeps restarting. The
+SES email alert covers the first one too, so Grafana alerting is optional.
+

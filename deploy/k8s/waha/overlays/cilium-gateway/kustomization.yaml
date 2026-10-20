@@ -6,3 +6,7 @@ kind: Kustomization
 resources:
   - ../../base
   - tlsroute.yaml
+
+# Sessions in Postgres by default. To use a PVC instead, uncomment:
+# components:
+#   - ../../components/local-sessions

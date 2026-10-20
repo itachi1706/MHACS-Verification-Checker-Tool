@@ -30,7 +30,8 @@ spec:
         - name: waha
           image: devlikeapro/waha:gows-2026.9.2
           envFrom:
-            # WAHA_API_KEY, WHATSAPP_HOOK_HMAC_KEY, WHATSAPP_HOOK_URL
+            # WAHA_API_KEY, WHATSAPP_HOOK_HMAC_KEY, WHATSAPP_HOOK_URL,
+            # WHATSAPP_SESSIONS_POSTGRESQL_URL (omit when using components/local-sessions)
             - secretRef:
                 name: waha-env
           env:
@@ -54,6 +55,11 @@ spec:
               value: MHACS Verify
             - name: WAHA_EVENTS_DOWNLOAD_MEDIA
               value: "false"
+            # Database names: waha_mhacs (main) and waha_mhacs_default (session)
+            - name: WAHA_NAMESPACE
+              value: mhacs
+            - name: WAHA_PROMETHEUS_ENABLED
+              value: "True"
             - name: WAHA_LOCAL_STORE_BASE_DIR
               value: /app/.sessions
             - name: WHATSAPP_FILES_FOLDER
@@ -100,6 +106,8 @@ spec:
           ports:
             - name: mtls
               containerPort: 9443
+            - name: metrics
+              containerPort: 9090
           readinessProbe:
             tcpSocket:
               port: mtls
@@ -132,9 +140,10 @@ spec:
             - name: proxy-tmp
               mountPath: /tmp
       volumes:
+        # Sessions are stored in Postgres; components/local-sessions swaps this for a PVC.
         - name: sessions
-          persistentVolumeClaim:
-            claimName: waha-sessions
+          emptyDir:
+            sizeLimit: 256Mi
         - name: media
           emptyDir:
             sizeLimit: 256Mi

@@ -1,4 +1,4 @@
-# Only the mTLS proxy port is exposed. WAHA's own port (3000) is not part of the Service.
+# Only the mTLS proxy and metrics ports are exposed. WAHA's own port (3000) is not part of the Service.
 apiVersion: v1
 kind: Service
 metadata:
@@ -11,4 +11,8 @@ spec:
     - name: mtls
       port: 9443
       targetPort: mtls
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
       protocol: TCP

@@ -1,0 +1,20 @@
+# Fallback: keep WhatsApp sessions on a DO block-storage PVC instead of Postgres.
+# Enable by adding this component to an overlay, and leave
+# WHATSAPP_SESSIONS_POSTGRESQL_URL out of the waha-env secret.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - pvc.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: waha
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0
+        value:
+          name: sessions
+          persistentVolumeClaim:
+            claimName: waha-sessions

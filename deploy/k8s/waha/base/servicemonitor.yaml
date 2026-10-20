@@ -1,0 +1,15 @@
+# Requires the Prometheus Operator CRDs (e.g. kube-prometheus-stack). If your Prometheus
+# only selects ServiceMonitors with a label (kube-prometheus-stack default:
+# `release: <helm-release-name>`), add that label here.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: waha
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: waha
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
