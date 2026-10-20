@@ -103,9 +103,13 @@ volumeMounts: /app/.sessions -> PVC waha-sessions (1Gi)
 resources: requests 100m / 384Mi, limits 500m / 768Mi
 probes: GET /ping  (liveness/readiness)
 ---
-Service: ClusterIP :3000
-Ingress: waha.<domain> -> Service, TLS via cert-manager,
-         client-certificate (mTLS) required, path /api only; reuse the existing ingress/LB
+# Sidecar in the same pod: mtls-proxy (nginx-unprivileged, pinned)
+listens :8443 TLS; ssl_verify_client on (our private CA); only /api/* -> http://127.0.0.1:3000
+---
+Service: ClusterIP, port 8443 -> mtls-proxy only (WAHA's :3000 is never exposed)
+Route: TLS passthrough on SNI waha.<route53-domain> -> Service :8443
+       (ingress-nginx: ssl-passthrough Ingress; Cilium: TLSRoute on the shared Gateway)
+NetworkPolicy (CiliumNetworkPolicy): ingress only to :8443; egress to DNS + internet for WhatsApp/webhooks
 ```
 
 The env var names above follow WAHA's docs. We'll check them against the pinned version
@@ -118,24 +122,51 @@ locked down. Lambda has no fixed outgoing IP, and the team doesn't want a NAT. S
 lock it down **by identity instead of by IP**. That costs nothing, and the Lambdas run
 **outside any VPC**.
 
-**Chosen: three layers, all free**
+**Chosen: three layers, all free and independent of the ingress controller**
 
-1. **TLS** on the Ingress (cert-manager + Let's Encrypt).
-2. **Mutual TLS (client certificate).** The Ingress rejects any connection that doesn't
-   present a client certificate signed by our own private CA. This happens before a
-   request reaches WAHA, so scanners and bots never see it. The Lambdas load the client
-   cert and key from an SST `Secret` and pass them to an `undici` `Agent`.
-   - ingress-nginx: `nginx.ingress.kubernetes.io/auth-tls-secret` +
-     `auth-tls-verify-client: "on"`. ingress-nginx was retired in March 2026, so on a
-     current cluster use whatever controller is installed. Traefik (`TLSOption`
-     `clientAuth`) and Envoy Gateway / Gateway API (`ClientTrafficPolicy`) both support
-     this.
-3. **`WAHA_API_KEY`** on every request, with WAHA's dashboard and Swagger turned off.
+The cluster runs **ingress-nginx** (retired) today and will move to **Cilium Gateway**.
+Cilium's Gateway API does **not yet support** client-certificate validation
+(GEP-91 / `GatewayFrontendClientCertificateValidation`): upstream PR cilium/cilium#48587
+is still unmerged. So mTLS **can't depend on the edge**. It's handled **inside the WAHA
+pod**, and the edge only does **TLS passthrough** by hostname (SNI). Both controllers
+support passthrough, so the pod, the certificates and the Lambda code stay the same
+through the migration. Only one routing object changes.
 
-Also: only expose `/api/*` through the Ingress. WAHA runs as non-root with no extra
-privileges, and has a NetworkPolicy limiting what it can reach.
+1. **mTLS sidecar** (`nginx-unprivileged`, pinned) in the WAHA pod:
+   - It terminates TLS with a **server cert issued by our own private CA** (no Let's
+     Encrypt or cert-manager needed, because only our Lambdas connect and they trust
+     that CA).
+   - It requires a **client cert** signed by the same CA (`ssl_verify_client on`).
+   - It forwards only `/api/*` to WAHA on `127.0.0.1:3000`.
+   - Connections without the client cert are dropped during the TLS handshake, so
+     scanners never reach WAHA.
+   - The Lambdas keep the CA cert, client cert and key in SST `Secret`s and pass them to
+     an `undici` `Agent` (`ca`, `cert`, `key`).
+2. **`WAHA_API_KEY`** on every request, with WAHA's dashboard and Swagger turned off.
+3. **NetworkPolicy** (enforced by Cilium): only the sidecar port is reachable, and WAHA's
+   own port is never exposed by the Service. Both containers run as non-root with
+   `readOnlyRootFilesystem`, and the volume is the only writable path.
 
-**Alternative with no inbound connections at all: Cloudflare Tunnel.** This needs a
+**Routing during each phase (the only part that changes):**
+
+| | Today: ingress-nginx | Later: Cilium Gateway |
+|---|---|---|
+| Object | `Ingress` with `nginx.ingress.kubernetes.io/ssl-passthrough: "true"` and `backend-protocol: HTTPS` | `TLSRoute` (Gateway API) on a `TLS` listener with `mode: Passthrough` and `hostname: waha.<domain>` |
+| Requirement | The controller must run with `--enable-ssl-passthrough`. Check whether it already does; if not, adding the flag is a one-line Helm value. | TLSRoute is an *experimental-channel* CRD. Install the experimental Gateway API CRDs that match the Cilium version, and add the listener to the **existing shared Gateway** (a new Gateway creates a new DO LB, about US$12/month). |
+| Fallback | Native `auth-tls-*` annotations at the edge (also works, but has to be redone after the migration) | When Cilium ships GEP-91, mTLS *could* move to the edge, but nothing has to change |
+
+**DNS:** just an `A`/`CNAME` record such as `waha.<your-route53-domain>` → the existing
+load balancer IP. No Cloudflare needed. It's machine-to-machine only, so the name can
+stay obscure.
+
+**Extra cost: US$0.** It reuses the existing load balancer and uses a private CA (free).
+
+**Certificate handling:** the CA key is generated once (offline, kept by the admin) and
+never stored in the cluster. Server and client certs are valid for 1 year. A runbook and
+a script (`scripts/certs.sh` using `openssl`) handle rotation. The health-check cron
+warns by email 30 days before the client or server cert expires.
+
+**Alternative (not used: no suitable Cloudflare domain; personal domains excluded): Cloudflare Tunnel.** This needs a
 domain on Cloudflare. *Any* domain works, because only our Lambdas call this hostname
 (e.g. a spare domain at about US$10/year ≈ US$0.85/month; the free plan is enough).
 `cloudflared` runs in the cluster and connects out to Cloudflare, so WAHA needs no
@@ -164,7 +195,7 @@ load balancer.
  Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda ─┐ (no VPC)
   (IP allowlist + login)                                  │ mTLS client cert + X-Api-Key
                                                           ▼
-                              DOKS Ingress (TLS, client-cert required) ──► WAHA pod + PVC
+        DOKS edge (TLS passthrough by SNI) ──► WAHA pod [mTLS sidecar → WAHA] + PVC
                                                                            │    ▲
  WhatsApp ◄──────────────────────── linked device ─────────────────────────┘    │
                                                                                 │
@@ -325,7 +356,7 @@ layer would change.
 | Unknown services | Pending suggestion for an admin to approve in the web app |
 | Hosting | AWS: SST + OpenNext on Lambda. WAHA on the existing **DigitalOcean Kubernetes** cluster, using the official image plus manifests (see §3). |
 | WAHA storage | No database. One 1–2 GiB PVC for session files (see §3.2). |
-| WAHA access | No NAT. TLS + **mTLS client cert** + API key (free). Cloudflare Tunnel + Access service token if a Cloudflare domain is available. Webhooks verified by HMAC. |
+| WAHA access | No NAT, no Cloudflare. **mTLS handled by a sidecar in the WAHA pod** (private CA) + API key + NetworkPolicy. The edge only does TLS passthrough (ingress-nginx now, Cilium `TLSRoute` later). Webhooks verified by HMAC. |
 | Budget | Free, or under US$5/month. Not for public use. |
 | Alerts | Email via SES |
 | Access | Cloudflare Access if feasible (see §4), otherwise an IP allowlist from env vars, plus app login |
@@ -336,7 +367,9 @@ layer would change.
 ```
 /                       SST v3 monorepo (pnpm workspaces)
 ├─ sst.config.ts        Dynamo, Nextjs, Functions, Cron, SES, Secrets (no VPC)
-├─ deploy/k8s/waha/     Namespace, Secret (template), PVC, Deployment, Service, Ingress (Kustomize)
+├─ deploy/k8s/waha/     Kustomize base: Namespace, Secrets (templates), PVC, Deployment (WAHA + mTLS sidecar),
+│                        Service, NetworkPolicy; overlays: ingress-nginx (passthrough Ingress), cilium (TLSRoute)
+├─ scripts/certs.sh     private CA / server / client cert generation + rotation
 ├─ packages/
 │  ├─ core/             domain logic: parser, renderer, entities, WAHA client (pure TS + tests)
 │  ├─ web/              Next.js admin app (OpenNext)
@@ -349,7 +382,7 @@ layer would change.
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0: Spike** | Run WAHA locally in Docker and link the Business number. Send to the test group. Record real webhook payloads and reposts. Choose the engine (**GOWS** or **NOWEB**: no Chromium, low memory) and check the needed features work in the free *Core* tier (one session is enough). | Sending, receiving, deleting and session-status events all work |
-| **1: Foundations** | WAHA manifests deployed to DOKS (PVC, Ingress with TLS + mTLS, API key). Private CA and client cert. SST infra (DynamoDB, Next.js, Secrets). Web app IP allowlist. Admin login. | The admin app is reachable only from allowed IPs. WAHA rejects requests without the client cert. Pod restarts don't log the bot out. |
+| **1: Foundations** | WAHA + mTLS sidecar deployed to DOKS (PVC, passthrough route, NetworkPolicy, API key). Private CA and server/client certs. SST infra (DynamoDB, Next.js, Secrets). Web app IP allowlist. Admin login. | The admin app is reachable only from allowed IPs. WAHA rejects requests without the client cert. Pod restarts don't log the bot out. |
 | **2: MVP sending** | Services, groups and templates CRUD. Wizard, preview, send. Manual grid, send update, close, delete message. | A full verification can be run by hand |
 | **3: Auto-parsing** | Webhook, parser (with tests from real reposts), audit feed, suggestions | Reposts in the test group update the grid by themselves |
 | **4: Ops** | Session alerts (SES), health cron, QR/pairing page, backups (DynamoDB PITR) | A forced logout produces an email within 10 minutes |
