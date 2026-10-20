@@ -71,18 +71,33 @@ specific version tag (never `latest`), and configure it with env vars and a Secr
 we need anything custom later, it would be a thin `FROM devlikeapro/waha:<ver>` layer.
 What we deliver is **Kubernetes manifests** (or a Kustomize overlay) for the cluster.
 
-### 3.2 Storage: does WAHA need a database?
+### 3.2 Storage: Postgres (chosen) or a persistent volume
 
-**No separate database. It does need a persistent volume.**
+WAHA Core can store the session in **Postgres or MongoDB**
+(`WHATSAPP_SESSIONS_POSTGRESQL_URL` / `WHATSAPP_SESSIONS_MONGO_URL`). Checked in the image:
+with Postgres, the GOWS engine stores **both the login and its message/chat/group store**
+in the database (otherwise it's SQLite on disk). **MySQL isn't supported.**
 
-- WAHA *Core* (free) stores the WhatsApp session (keys and login state) as **files on
-  disk**. GOWS/NOWEB keep a small local store in the same folder. Without a persistent
-  volume, every pod restart logs the bot out and needs a new QR scan.
-- → **PVC of 1–2 GiB** (`ReadWriteOnce`, `do-block-storage`), mounted at the sessions path
-  (`/app/.sessions`). Add `/app/.media` only if we ever handle media.
-- WAHA can also save sessions to Postgres/MongoDB (`WHATSAPP_SESSIONS_POSTGRESQL_URL` / `_MONGO_URL`). We don't need that: a PVC is simpler and free.
-- Our own app data (verifications, statuses, audit) lives in **DynamoDB**, not in WAHA.
-- DO block storage costs about US$0.10/GiB/month, so **about US$0.20/month**.
+| | Existing DO managed Postgres (chosen) | PVC (fallback) |
+|---|---|---|
+| Cost | US$0 (already paid) | About US$0.10/GiB/month |
+| Backups | Included in the managed DB's daily backups and PITR | None. Losing the volume means a QR re-link and an empty history store |
+| Pod scheduling | Stateless pod that restarts or moves nodes instantly | Pod is tied to a block volume, which has to detach and reattach on node upgrades |
+| History catch-up (§3.7) | Message store survives pod or volume loss | Lost along with the volume |
+| Dependencies | The bot is down if the DB is down. Uses about 10–20 connections. Needs `CREATEDB` or pre-created DBs | None beyond the cluster |
+
+→ **Use the existing Postgres.** The PVC stays available as a Kustomize component
+(`components/local-sessions`) to switch back with one line.
+
+Details (from the image):
+- WAHA creates the databases `waha_<WAHA_NAMESPACE>` and `waha_<namespace>_<session>`,
+  i.e. `waha_mhacs` and `waha_mhacs_default`. It checks whether they exist first, so they
+  can be pre-created if the user can't `CREATEDB`.
+- Connect directly, not through PgBouncer (WAHA runs `CREATE DATABASE` and keeps its own
+  pools).
+- TLS is used but the server cert isn't verified. That's acceptable inside the DO VPC.
+- Our own app data (verifications, statuses, audit) still lives in **DynamoDB**, next to
+  the Lambdas.
 
 ### 3.3 Kubernetes shape
 
@@ -96,12 +111,16 @@ Application in `deploy/argocd/`). Setup steps are in `deploy/k8s/waha/README.md`
   - Dashboard and Swagger off. Runs as non-root.
   - Sidecar `mtls-proxy` (`nginxinc/nginx-unprivileged:1.30.6-alpine`, read-only root
     filesystem).
-- **PVC `waha-sessions`**: 1 GiB, `do-block-storage`, protected from Argo CD prune/delete.
+- **Session storage**: the existing DO managed Postgres (`WHATSAPP_SESSIONS_POSTGRESQL_URL`).
+  Optional PVC component as a fallback.
+- **Metrics**: `WAHA_PROMETHEUS_ENABLED`. The sidecar serves only `/metrics` on port 9090
+  (monitoring namespace only), with a `ServiceMonitor`.
 - **Service `waha-mtls`**: port 9443 → the sidecar only. WAHA's port 3000 isn't in the Service.
 - **NetworkPolicy**: inbound traffic only to 9443. Outbound is open (WhatsApp and the webhook
   Lambda have no fixed IPs).
 - **Secrets, created by hand and not in git**:
-  - `waha-env`: `WAHA_API_KEY`, `WHATSAPP_HOOK_HMAC_KEY`, `WHATSAPP_HOOK_URL`.
+  - `waha-env`: `WAHA_API_KEY`, `WHATSAPP_HOOK_HMAC_KEY`, `WHATSAPP_HOOK_URL`,
+    `WHATSAPP_SESSIONS_POSTGRESQL_URL`.
   - `waha-mtls`: server cert/key + CA.
 
 **Checked against the actual image** (`gows-2026.9.2`, published 2026-10-02):
@@ -199,7 +218,7 @@ load balancer.
  Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda ─┐ (no VPC)
   (IP allowlist + login)                                  │ mTLS client cert + X-Api-Key
                                                           ▼
-        DOKS edge (TLS passthrough by SNI) ──► WAHA pod [mTLS sidecar → WAHA] + PVC
+        DOKS edge (TLS passthrough by SNI) ──► WAHA pod [mTLS sidecar → WAHA] → DO Postgres
                                                                            │    ▲
  WhatsApp ◄──────────────────────── linked device ─────────────────────────┘    │
                                                                                 │
@@ -217,7 +236,7 @@ ap-southeast-1 list prices (approximate), 24/7 for about 730 hours/month:
 
 | Option | Compute | Public IPv4 (US$0.005/h) | Storage | **≈ Monthly** |
 |---|---|---|---|---|
-| **DOKS (existing cluster)** | spare capacity | uses the existing LB | PVC ≈ US$0.20 | **≈ US$0.20** |
+| **DOKS (existing cluster)** | spare capacity | uses the existing LB | existing Postgres, US$0 | **≈ US$0** |
 | Fargate, 0.25 vCPU / 0.5 GB, ARM, on-demand | ≈ US$7 | ≈ US$3.65 | EFS ≈ US$0.30 | ≈ US$11 |
 | Fargate Spot, ARM | ≈ US$2–3 (can be interrupted, then reconnects) | ≈ US$3.65 | EFS ≈ US$0.30 | ≈ US$6–7 |
 | EC2 t4g.nano + Docker | ≈ US$3.1 | ≈ US$3.65 | EBS 2 GB ≈ US$0.20 | ≈ US$7 |
@@ -232,25 +251,27 @@ the cost straight back.
 
 → **Keep WAHA on DOKS.** It's the only option that is free or nearly free.
 
-### 3.7 WAHA Core features we can now use
+### 3.7 WAHA Core features in the first version
 
 Checked in the `gows-2026.9.2` Core image: the GOWS engine implements these, and Core no
-longer restricts them. Core also supports **multiple sessions** now.
+longer restricts them. **All of the following are in the first version** (decided by
+the team):
 
-| WAHA feature | How we'd use it | When |
-|---|---|---|
-| **Fetch chat history** (`GET /api/{session}/chats/{chatId}/messages`) | **Catch-up / reconcile**: after WAHA restarts, a webhook failure or Lambda errors, re-read the group's messages since the last processed one and run them through the parser (deduped by message id). This means a missed webhook never loses a status. | MVP (phase 3) |
-| **Reactions** (`PUT /api/reaction`) | React **👍** to a member's message once its changes are applied, so they can see the bot picked it up. Messages with nothing to apply get no reaction. | MVP (phase 3) |
-| **Groups + participants** (`GET /api/{session}/groups`, `.../participants`) | Choose the target group from a list in the template editor. Show who's in the group. Map participant numbers to POCs, which is the basis for the later "only the POC can update" restriction. | MVP (phase 2) |
-| **Reply / quote** (`reply_to` on `sendText`) | Update and closing messages quote the original checklist, so they stay together in the group. | MVP (phase 2) |
-| **Mentions** (`mentions` on `sendText`) | Reminders **@mention** the POCs whose services are still ❓. Needs the POC→number mapping. | Later |
-| **Multiple sessions** | Optional: a second number as a separate "test" session alongside production, in the same pod. | Optional |
-| **Prometheus metrics** (`WAHA_PROMETHEUS_ENABLED`) | Only if the cluster already runs Prometheus/Grafana. | Optional |
-| Polls, events, labels, Chatwoot/MCP apps, S3/Postgres media & session storage | Not useful for this workflow, or would add cost or complexity. | Not used |
+| WAHA feature | How we use it |
+|---|---|
+| **Fetch chat history** (`GET /api/{session}/chats/{chatId}/messages`) | **Catch-up / reconcile**: after a WAHA restart, a webhook failure or Lambda errors, re-read the group's messages since the last processed one and run them through the parser (deduped by message id). Triggered when `session.status` turns `WORKING`, and by the health-check cron. |
+| **Reactions** (`PUT /api/reaction`) | React **👍** to a member's message once its changes are applied. Messages with nothing to apply get no reaction. |
+| **Groups + participants** (`GET /api/{session}/groups`, `.../participants`) | Choose the target group from a list in the template editor. Show the group's members. Map participant numbers to POCs (the basis for "only the POC can update" later). |
+| **Reply / quote** (`reply_to` on `sendText`) | Update, reminder and closing messages quote the original checklist. |
+| **Mentions** (`mentions` on `sendText`) | A **"Send reminder"** button posts the outstanding services and **@mentions** their POCs (using the POC→number mapping). POCs without a mapped number are listed by name. |
+| **Prometheus metrics** (`WAHA_PROMETHEUS_ENABLED`) | Scraped by the team's Prometheus, with Grafana dashboards and alerts on `waha_session_status` and `waha_up`. |
+
+**Kept in view for later:** multiple sessions (a separate test number), polls, events,
+labels. **Not used:** Chatwoot/MCP apps, S3/Postgres media storage.
 
 Still Plus-only in this build: **API key management** (multiple keys) and image/voice/video
-**status** posts. We need neither. The spike checks each "MVP" row on the real number
-before we build on it.
+**status** posts. We need neither. The spike checks each row on the real number before we
+build on it.
 
 ## 4. Restricting access to the web app
 
@@ -352,6 +373,8 @@ The parser is a **pure function** with tests run against real reposts from the t
 | F13 | 👍 reaction on applied updates | §3.7 |
 | F14 | Group picker + participant list | §3.7 |
 | F15 | Updates/closing quote the original message | §3.7 |
+| F16 | POC→phone mapping + "Send reminder" with @mentions | §3.7. Numbers picked from the group's participant list |
+| F17 | Prometheus metrics + Grafana | §3.7, `deploy/k8s/waha/README.md` §10 |
 
 ## 8. Data model (DynamoDB, single table with ElectroDB)
 
@@ -383,7 +406,9 @@ layer would change.
 | Who can update | Anyone in the group, for now |
 | Unknown services | Pending suggestion for an admin to approve in the web app |
 | Hosting | AWS: SST + OpenNext on Lambda. WAHA on the existing **DigitalOcean Kubernetes** cluster, using the official image plus manifests (see §3). |
-| WAHA storage | No database. One 1–2 GiB PVC for session files (see §3.2). |
+| WAHA storage | Existing DO managed **Postgres** (sessions + GOWS store). PVC kept as a fallback component (see §3.2). |
+| First-version extras | History catch-up, 👍 reactions, group picker, quoted replies, @mention reminders, Prometheus metrics (see §3.7) |
+| Kept for later | Multiple sessions, polls, events, labels |
 | WAHA access | No NAT, no Cloudflare. **mTLS handled by a sidecar in the WAHA pod** (private CA) + API key + NetworkPolicy. The edge only does TLS passthrough (ingress-nginx now, Cilium `TLSRoute` later). Webhooks verified by HMAC. |
 | Budget | Free, or under US$5/month. Not for public use. |
 | Alerts | Email via SES |
@@ -395,8 +420,10 @@ layer would change.
 ```
 /                       SST v3 monorepo (pnpm workspaces)
 ├─ sst.config.ts        Dynamo, Nextjs, Functions, Cron, SES, Secrets (no VPC)
-├─ deploy/k8s/waha/     Kustomize base: Namespace, Secrets (templates), PVC, Deployment (WAHA + mTLS sidecar),
-│                        Service, NetworkPolicy; overlays: ingress-nginx (passthrough Ingress), cilium (TLSRoute)
+├─ deploy/k8s/waha/     Kustomize base: Namespace, Deployment (WAHA + mTLS/metrics sidecar), Service, NetworkPolicy,
+│                        ServiceMonitor; components/local-sessions (PVC fallback);
+│                        overlays: ingress-nginx (TCP 9443), cilium-gateway (TLSRoute)
+├─ deploy/argocd/       Argo CD Application
 ├─ scripts/certs.sh     private CA / server / client cert generation + rotation
 ├─ packages/
 │  ├─ core/             domain logic: parser, renderer, entities, WAHA client (pure TS + tests)
@@ -409,22 +436,22 @@ layer would change.
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0: Spike** | Deploy `deploy/k8s/waha` to DOKS via Argo CD and link the Business number. Send to the test group. Record real webhook payloads and reposts. Confirm WAHA runs fine as non-root (uid 1000) with the PVC. | Sending, receiving, deleting and session-status events work through the mTLS endpoint |
-| **1: Foundations** | WAHA + mTLS sidecar deployed to DOKS (PVC, passthrough route, NetworkPolicy, API key). Private CA and server/client certs. SST infra (DynamoDB, Next.js, Secrets). Web app IP allowlist. Admin login. | The admin app is reachable only from allowed IPs. WAHA rejects requests without the client cert. Pod restarts don't log the bot out. |
-| **2: MVP sending** | Services, groups and templates CRUD. Wizard, preview, send. Manual grid, send update, close, delete message. | A full verification can be run by hand |
-| **3: Auto-parsing** | Webhook, parser (with tests from real reposts), audit feed, suggestions | Reposts in the test group update the grid by themselves |
+| **0: Spike** | Deploy `deploy/k8s/waha` to DOKS via Argo CD and link the Business number. Send to the test group. Record real webhook payloads and reposts. Confirm WAHA runs fine as non-root (uid 1000) with Postgres storage. Check the §3.7 features on the real number. Confirm the Prometheus scrape works. | Sending, receiving, deleting and session-status events work through the mTLS endpoint |
+| **1: Foundations** | WAHA + mTLS sidecar deployed to DOKS (Postgres storage, passthrough route, NetworkPolicy, API key, metrics). Private CA and server/client certs. SST infra (DynamoDB, Next.js, Secrets). Web app IP allowlist. Admin login. | The admin app is reachable only from allowed IPs. WAHA rejects requests without the client cert. Pod restarts don't log the bot out. |
+| **2: MVP sending** | Services, groups and templates CRUD. Group picker. POC→number mapping. Wizard, preview, send. Manual grid, send update (quoted), reminder with @mentions, close, delete message. | A full verification can be run by hand |
+| **3: Auto-parsing** | Webhook, parser (with tests from real reposts), 👍 reactions, history catch-up, audit feed, suggestions | Reposts in the test group update the grid by themselves |
 | **4: Ops** | Session alerts (SES), health cron, QR/pairing page, backups (DynamoDB PITR) | A forced logout produces an email within 10 minutes |
 | **5: Go-live** | Switch the template's target to the real group | — |
 
 Rough added running cost: WAHA uses spare capacity on the existing DOKS cluster, plus about
-US$0.20 for the PVC (plus about US$0.85 if a spare Cloudflare domain is bought for the
-Tunnel option). Lambda, DynamoDB, CloudFront and SES are within or about at free-tier
-levels at this volume. **Total about US$0.20–1/month.**
+US$0 for storage (the existing managed Postgres). Lambda, DynamoDB, CloudFront and SES are within or about at free-tier
+levels at this volume. **Total about US$0/month.**
 
 ## 12. Future enhancements
 
 - Restrict updates for a service to its mapped POC(s), matched by sender phone number.
-- Reminders ("3 services still ❓"), sent automatically or by an admin with one click, **@mentioning** the outstanding POCs.
+- Scheduled reminders (the manual "Send reminder" button is in the first version).
+- Multiple WAHA sessions (e.g. a separate test number).
 - Accept quoted replies and emoji reactions as status updates.
 - CSV/PDF export of a closed verification.
 - Cloudflare Access, if a suitable Cloudflare zone becomes available.
@@ -447,6 +474,9 @@ levels at this volume. **Total about US$0.20–1/month.**
 8. **Web app login:** who are the admins, and how should they sign in (email magic link via
    SES, or Google/Microsoft SSO)?
 9. **One open verification per group at a time?** (Assumed yes.)
-10. **Backups:** losing the PVC only means re-linking the bot, so no volume snapshots are
-    planned (they would cost extra). OK?
+10. ~~Backups~~: covered by the managed Postgres backups.
+11. **Postgres:** can the `waha` user have `CREATEDB`, or will you pre-create the two
+    databases? Is there room for about 10–20 more connections on the DB plan?
+12. **Prometheus:** is it kube-prometheus-stack (Prometheus Operator)? What namespace is it
+    in, and what `release` label does it select ServiceMonitors by?
 
