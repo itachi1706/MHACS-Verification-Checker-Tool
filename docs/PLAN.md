@@ -121,7 +121,8 @@ Application in `deploy/argocd/`). Setup steps are in `deploy/k8s/waha/README.md`
 - **Service `waha-mtls`**: port 9443 → the sidecar only. WAHA's port 3000 isn't in the Service.
 - **NetworkPolicy**: inbound traffic only to 9443. Outbound is open (WhatsApp and the webhook
   Lambda have no fixed IPs).
-- **Secrets, created by hand and not in git**:
+- **Secrets, managed by Argo CD from OpenBao** (argocd-vault-plugin `<path:...>` placeholders,
+  no values in git):
   - `waha-env`: `WAHA_API_KEY`, `WHATSAPP_HOOK_HMAC_KEY`, `WHATSAPP_HOOK_URL`,
     `WHATSAPP_SESSIONS_POSTGRESQL_URL`.
   - `waha-mtls`: server cert/key + CA.
@@ -415,6 +416,7 @@ layer would change.
 | WAHA access | No NAT, no Cloudflare. **mTLS handled by a sidecar in the WAHA pod** (private CA) + API key + NetworkPolicy. The edge only does TLS passthrough (ingress-nginx now, Cilium `TLSRoute` later). Webhooks verified by HMAC. |
 | Budget | Free, or under US$5/month. Not for public use. |
 | Alerts | Email via SES |
+| Cluster secrets | OpenBao, filled into the manifests by argocd-vault-plugin at render time |
 | Access | Cloudflare Access if feasible (see §4), otherwise an IP allowlist from env vars, plus app login |
 | Language | TypeScript throughout. WAHA is a REST API, so Python adds nothing. TS types come from WAHA's OpenAPI spec. |
 
@@ -463,9 +465,7 @@ levels at this volume. **Total about US$0/month.**
 
 1. **ingress-nginx Service annotations:** is PROXY protocol enabled on the DO load balancer?
    Is `do-loadbalancer-protocol` set? This decides the exact `tcp:` value (see the deploy README).
-2. **Secrets in the cluster:** create them by hand with `kubectl` (current default), or do you
-   use Sealed Secrets / External Secrets? AWS SSM Parameter Store standard tier is free; AWS
-   Secrets Manager is about US$0.40 per secret per month.
+2. ~~Secrets in the cluster~~: OpenBao + argocd-vault-plugin (paths in `deploy/k8s/waha/README.md` §2).
 3. **Repo visibility:** is the repo private? Argo CD then needs a read-only token.
 4. **WAHA hostname:** which Route 53 subdomain (e.g. `waha.<domain>`)?
 5. **Cluster capacity and architecture:** WAHA needs about 256–768 MiB RAM. Are the nodes
