@@ -1,21 +1,21 @@
-# MHACS Verification Checker Tool — Feasibility & Plan
+# MHACS Verification Checker Tool: Feasibility & Plan
 
-> Status: **exploratory / planning only**. No implementation yet.
+> Status: **planning only**. Nothing is built yet. Revision 2 adds the team's answers
+> (see §9).
 
 ## 1. Problem
 
 During a production cut-over, a coordinator posts a long checklist message into the
-"MHACS eServices" WhatsApp group. Each eService team copies the message, puts
-✅ / ➖ / ❓ / ❌ / ⚠️ on the left of their own line, and reposts it. The coordinator
-then has to read every repost to work out the current state.
+"MHACS eServices" WhatsApp group. Each eService team copies the latest list, puts
+✅ / ➖ / ❓ / ❌ / ⚠️ on the left of their own line, and posts it again as a new message.
+The coordinator then has to read every repost to work out the current state.
 
-Example of the message shape:
+Message shape:
 
 ```
 Hi eService Teams,
 
-Please verify your eServices on Production now and let us know if your
-integration is working. Please help acknowledge by putting a ✅ or ➖ (not
+Please verify your eServices on Production now ... putting a ✅ or ➖ (not
 applicable) on the left of your eService.
 ...
 
@@ -26,156 +26,230 @@ SingPass:
 ...
 ```
 
-The goal is a small web tool that builds this message from templates, sends it to the
-group, reads the replies, keeps a single source of truth for the statuses, and lets admins
-repost or close the verification.
+Goal: a web tool that builds this message from templates and sends it to the group. It
+reads the replies and keeps the current status of each service in one place. Admins can
+post an updated list or close the verification.
 
-## 2. Verdict: is it possible?
+## 2. Verdict
 
-**Yes.** Every requirement can be built. The one real constraint is **how we talk to
-WhatsApp**:
+**This can be built**, using **WAHA** (self-hosted WhatsApp HTTP API) linked to a dedicated
+**WhatsApp Business app** number.
 
-| Option | Can post into an *existing* group with people already in it? | Can read group replies? | Notes |
-|---|---|---|---|
-| **WhatsApp Business Cloud API (official, Meta)** | ❌ Not really. Meta's Groups API only covers groups the business creates itself, with a small participant cap, and members join by invite link. Our existing group can't be used. | Only in those business-created groups | Needs Meta Business verification, a dedicated number, and pre-approved templates for business-initiated messages. |
-| **WAHA (WhatsApp HTTP API, self-hosted)** | ✅ Yes. It acts as a linked device on a normal WhatsApp account. | ✅ Yes, via webhooks (`message`, `message.any`, `message.edited`, `message.reaction`) | Unofficial (drives WhatsApp Web), so it's against WhatsApp ToS and the number could be banned. Fine for low volume. |
-| Other unofficial libraries (Baileys, whatsapp-web.js) | ✅ | ✅ | WAHA wraps these engines (NOWEB/GOWS/WEBJS) behind a stable REST API and Docker image, so we'd just be rebuilding WAHA. |
+- The official WhatsApp Cloud API can't post into an existing group of external people,
+  so WAHA is the only practical option here.
+- The bot number being on the **WhatsApp Business app** is fine. WAHA connects as a
+  *linked device*, just like WhatsApp Web, and this works for both normal and Business
+  accounts. **Don't** move the number onto the Meta *Cloud API*. That takes it off the
+  app and breaks the linked-device setup.
+- Everything we send is a **new message**. We never edit. We do support **deleting our
+  own messages**: WAHA `DELETE /api/{session}/chats/{chatId}/messages/{messageId}`.
+  WhatsApp only allows "delete for everyone" for about 2 days after sending.
+- The group is unofficial and isn't covered by any data-classification rules (confirmed by
+  the team). The remaining risk is the usual one for unofficial integrations: WhatsApp
+  could ban the number. Low volume and a dedicated number keep this risk small.
 
-**Recommendation: WAHA**, behind an internal adapter interface (`WhatsAppGateway`), so we can
-swap in the official API or another channel (e.g. Teams, Telegram) later without touching
-the core logic.
+## 3. The key constraint: WAHA cannot run in Lambda
 
-### Risks to accept or mitigate before going ahead
+WAHA keeps a **permanent WebSocket connection** to WhatsApp and stores session files on
+disk. Lambda is short-lived and stateless, so it can't host WAHA. The rest of the system
+can be serverless.
 
-1. **ToS / ban risk.** Use a **dedicated SIM/number** for the bot, not anyone's personal number.
-   Keep volume low (a handful of messages per verification, no bulk messaging).
-2. **Organisational policy.** This looks like a government (MHA) context. Check whether
-   an unofficial WhatsApp integration, and storing group messages on our own server, is
-   allowed under the relevant IT and data-classification policies (e.g. IM8). **This is
-   the most likely blocker, and it isn't a technical one.**
-3. **Session lifetime.** A linked device can get logged out. If the phone is offline for
-   about 14 days, WhatsApp unlinks it. Planned mitigation: a health check, plus an admin
-   page that shows the WAHA QR code / pairing code so the session can be relinked.
-4. **Parsing ambiguity.** People will reformat the text. Mitigation: match on the
-   **service code**, never on line position, and let admins override.
-5. **WhatsApp edit window.** A sent message can only be edited for about 15 minutes, so
-   "updated status" is sent as a **new message** (optionally quoting the original), not
-   an edit.
-
-## 3. Feature breakdown (mapped to the requirements)
-
-| # | Requirement | Design |
+| Component | Runs on | Why |
 |---|---|---|
-| R1 | Integrate with WhatsApp to craft and send template messages | WAHA `POST /api/sendText` to the group `chatId` (`...@g.us`). The message is rendered server-side from the template. |
-| R2 | IP restriction to specific incoming IPs only | Allowlist at two layers: the reverse proxy (Caddy/Nginx `allow`/`deny`) and app middleware (CIDR allowlist from config, with `X-Forwarded-For` trusted only from the proxy). WAHA is **never exposed** and only talks to the app on the internal Docker network, protected by its API key. |
-| R3 | Groups of services, each with services and a POC | `ServiceGroup` (e.g. "SingPass", "CorpPass") → `Service` (code, display name, POC text, order, active flag). CRUD UI. |
-| R4 | Customisable opening and closing text | Each template has a `header` (intro), a `footer` (thank-you), and a `closing_message`. Placeholders such as `{{date}}`, `{{title}}`, `{{summary}}`. |
-| R5 | Flow: choose template → edit top text → preview → send | A 4-step wizard. The preview is the exact rendered WhatsApp text, including WhatsApp's `*bold*` / `_italic_` formatting. |
-| R6 | Bot reads replies and updates statuses (✅ ❌ ⚠️ ❓ ➖), ignoring unknown messages | Webhook → parser → status updates (see §5). Messages that match no service, or come from another chat, are ignored. |
-| R7 | Admins can manually update and send a new updated message | Status grid in the UI: click a cell to change it. A "Send updated list" button renders the current state and sends it. |
-| R8 | "Close verification" sends another customisable message | Closing sets the verification to `CLOSED`, sends the rendered `closing_message` (e.g. a summary of outstanding ❓/❌ items), and the parser stops accepting updates for it. |
+| Web app (Next.js) | **Lambda + CloudFront** via SST/OpenNext | As planned |
+| Webhook receiver, WAHA→app | **Lambda** (separate function) | Event-driven, cheap |
+| Health check / reminders | **Lambda on a cron** (EventBridge) | Event-driven |
+| Data | **DynamoDB** | No server to run, costs nothing when idle, works well with SST. The data set is tiny. |
+| **WAHA** | **ECS Fargate** service, 1 task, with an **EFS** volume for the session (SST `sst.aws.Service`) | Needs to run all the time. The EFS volume keeps the login across restarts, so no new QR scan after each deploy. |
 
-## 4. Architecture
+Cheaper fallback if Fargate is overkill: run WAHA on a small EC2 or Lightsail instance
+(about US$5/month) with Docker and a local volume.
 
-```
-          Admin browser (allowlisted IPs only)
-                     │ HTTPS
-              ┌──────▼──────┐
-              │ Caddy/Nginx │  IP allowlist, TLS
-              └──────┬──────┘
-                     │
-              ┌──────▼─────────────────────┐        ┌────────────┐
-              │  App (API + Web UI)        │◄──────►│ PostgreSQL │
-              │  - templates / services    │        │ (or SQLite)│
-              │  - verification engine     │        └────────────┘
-              │  - message parser          │
-              │  - WhatsAppGateway (WAHA)  │
-              └──────▲──────────┬──────────┘
-        webhook      │          │  REST (X-Api-Key)
-     (internal only) │          ▼
-              ┌──────┴────────────────┐
-              │  WAHA (Docker)        │ ── linked device ──► WhatsApp
-              │  internal network only│
-              └───────────────────────┘
-```
-
-Proposed stack (open to change):
-- **Backend:** TypeScript + Node (Fastify or NestJS), Prisma ORM. Python/FastAPI would work just as well.
-- **Frontend:** React (Vite) or Next.js, with a simple component library.
-- **DB:** PostgreSQL. SQLite is enough for a single-instance MVP.
-- **Deploy:** `docker compose` with `proxy`, `app`, `db`, `waha`.
-- **Auth:** the IP allowlist is not enough on its own, so add admin login too (local accounts or SSO/OIDC if available), with roles `admin` and `viewer`.
-
-## 5. Reply parsing (the core logic)
-
-1. A WAHA webhook arrives (`message` / `message.edited`). Verify the shared secret / HMAC.
-2. Drop it unless `chatId` is the group of an **OPEN** verification. Drop messages sent by the bot itself (`fromMe`).
-3. Split the body into lines. For each line:
-   - Normalise: Unicode NFC, strip variation selectors (`U+FE0F`), collapse whitespace.
-   - Find a **known service code** in the line (case-insensitive, word-boundary match,
-     longest code first so `MHAICA-eRBD` isn't confused with a shorter code).
-   - Read the **leading status token** before the code:
-     `✅ ✔️ ☑️` → `OK`, `❌ ✖️` → `FAIL`, `⚠️` → `WARN`, `❓ ?` → `UNKNOWN`,
-     `➖ - —` → `NA`. Anything else → ignore that line.
-4. Only apply a line when its status **differs** from the current one, so a full repost
-   that copies everyone else's unchanged statuses doesn't overwrite newer changes. Optional
-   stricter mode: only accept a change if the sender is a mapped POC for that service.
-5. Write a `StatusEvent` (service, old→new, sender, WhatsApp message id, raw line, time)
-   for the audit trail.
-6. Also optional: a **reaction** or a short reply like "✅" quoted on a single line, mapped
-   via `quotedMsg`.
-7. A message where nothing matches → ignored silently, as requested.
-
-Conflict example: Team A reposts at 10:46 with only their line changed, but their copy
-still shows Team B as ❓, while Team B already set ✅ at 10:45. Rule 4 keeps B at ✅
-only if we compare against the **version the poster copied from**. A simple heuristic:
-ignore a status that matches the *initial* default (❓/blank) when the current status
-is already set. Admins can always override.
-
-## 6. Data model (draft)
+### Networking
 
 ```
-ServiceGroup(id, name, sort_order)
-Service(id, group_id, code, display_name, poc, sort_order, active)
-Template(id, name, chat_id, header, footer, closing_message,
-         default_status, created_at, updated_at)
-TemplateService(template_id, service_id, sort_order)   -- which services a template includes
-Verification(id, template_id, title, header_override, status[DRAFT|OPEN|CLOSED],
-             chat_id, opened_by, opened_at, closed_at)
-VerificationItem(verification_id, service_id, status, updated_by, updated_at,
-                 snapshot_code, snapshot_poc)            -- snapshot so later edits don't rewrite history
-OutboundMessage(id, verification_id, kind[INITIAL|UPDATE|CLOSE], wa_message_id, body, sent_by, sent_at)
-StatusEvent(id, verification_id, service_id, old, new, source[WHATSAPP|ADMIN],
-            sender, wa_message_id, raw_line, created_at)
-AdminUser(id, email, role, ...)
+ Admin browser ──HTTPS──► CloudFront ──► Next.js Lambda (OpenNext) ──┐
+   (IP allowlist / CF Access)                                       │ private VPC
+                                                                    ▼
+ WhatsApp ◄──linked device──  WAHA (Fargate, private subnet) ◄── REST + X-Api-Key
+                                  │
+                                  └── webhook (HMAC-signed) ──► Webhook Lambda
+                                                                   │
+                                                 DynamoDB ◄────────┘
 ```
 
-## 7. Admin screens
+- WAHA runs in a **private subnet** with no public endpoint. The Next.js and webhook
+  Lambdas run in the same SST `Vpc` and call WAHA on its private address using the WAHA
+  API key.
+- WAHA still needs outbound internet. Use SST's `Vpc` with `nat: "ec2"` (a cheap NAT
+  instance, about US$3–5/month instead of about US$32 for a NAT Gateway). Add a free
+  DynamoDB gateway endpoint.
+- WAHA → webhook Lambda: a Lambda Function URL (or API Gateway) that is **not behind**
+  the admin IP allowlist. It is secured by checking WAHA's webhook **HMAC**
+  (`X-Webhook-Hmac`, SHA-512) and, optionally, by allowing only the NAT's Elastic IP.
 
-1. **Dashboard:** open verifications, WAHA session health (connected / QR needed).
-2. **Services & groups:** CRUD, drag to reorder, POC editing.
-3. **Templates:** header, footer, closing text, target group (picked from WAHA's group list), included services.
-4. **New verification wizard:** template → edit header → preview → send.
-5. **Live verification:** status grid that updates live (SSE/WebSocket), a feed of parsed changes with the raw message, manual override, "Send updated list", "Close verification".
-6. **History / audit:** past verifications with exports (CSV).
-7. **WhatsApp session:** QR / pairing code, logout, test message.
+## 4. Restricting access to the web app
 
-## 8. Phased delivery
+**Cloudflare Access when DNS stays in Route 53:** Access only works when traffic goes
+through Cloudflare, which needs the hostname in a Cloudflare zone. With DNS in Route 53:
+
+- **Partial (CNAME) setup** keeps DNS in Route 53, but needs a **Business plan or higher**.
+- **Delegating only a subdomain** (e.g. NS records for `verify.example.gov.sg` → Cloudflare)
+  is an **Enterprise** feature.
+- A **separate domain** you own that's already on Cloudflare (free plan) would work:
+  Cloudflare in front of the CloudFront origin. But the URL wouldn't be on the Route 53 domain.
+
+→ Unless one of these fits, **use the IP allowlist** (plus an app login). Planned approach:
+
+1. **IP allowlist, set from an env var** (`ALLOWED_CIDRS=1.2.3.4/32,5.6.7.0/24`):
+   - Primary: a **CloudFront Function** on viewer-request checks the client IP against the
+     list (very cheap, applied at the edge, and the IP can't be spoofed). SST puts the
+     list into the function at deploy time.
+   - Alternative: **AWS WAF IP set** on the CloudFront distribution (about US$6+/month,
+     can be changed without a redeploy).
+   - Backup check in Next.js middleware using `CloudFront-Viewer-Address`.
+     **Never trust `X-Forwarded-For`.**
+2. **App login on top of that:** a simple admin login (Auth.js with credentials, or a magic
+   link via SES), so a shared office IP isn't enough on its own. We can switch to Cloudflare
+   Access later without code changes, because the app will accept either.
+
+## 5. Reply parsing (core logic)
+
+The flow, as confirmed by the team: we send the original message (and any update) as new
+messages. Users copy the list, add their marks, and send it as a new message. We parse it
+and update our stored statuses.
+
+1. WAHA sends a webhook (`message`). Check the HMAC. **Ignore it** if it's from another
+   chat, if the chat has no **OPEN** verification, or if it's `fromMe` (our own message).
+   Use the WhatsApp message id to **skip duplicates**, because webhooks can be retried.
+2. Split the message into lines and normalise each one: Unicode NFC, remove the
+   `U+FE0F` emoji variation selector, collapse spaces.
+3. For each line, read the **leading status mark**:
+
+   | Mark(s) | Status |
+   |---|---|
+   | ✅ ✔ ☑ | `OK` |
+   | ❌ ✖ | `FAIL` |
+   | ⚠ | `WARN` |
+   | ❓ ❔ `?` | `PENDING` (the default) |
+   | ➖ `-` `—` | `NA` |
+
+   A line without a mark is ignored.
+4. Find the **service code** after the mark. Match it against known codes in the
+   verification (case-insensitive, whole-word, **longest code first**).
+5. **What to apply:** a repost is a full copy of the list, so most of its lines are other
+   teams' older statuses. The rules:
+   - Apply a line only if its status **differs** from the one we store.
+   - **Never go back to `PENDING`.** If we already have ✅ and a repost shows ❓, it's an
+     out-of-date copy. Ignore it.
+   - Any other change (✅→❌, ❌→✅, →⚠, →➖) applies, and the most recent message wins.
+6. **Unknown services:** a line in the shape `<mark> CODE[ (alias)], POC: name` whose code
+   we don't know creates a **pending service suggestion** (code, POC, the group header it
+   appeared under, sender, raw line). An admin approves it in the web app. Approval adds
+   it to the service catalog and, optionally, to the current verification. Repeated
+   sightings are merged by code.
+7. Anything else (chat, "noted", stickers) is **ignored**.
+8. Each change is saved as a `StatusEvent` (old→new, sender name/number, message id, raw
+   line, time), so admins can see where every status came from and undo it.
+
+The parser is a **pure function** with tests run against real reposts from the test group.
+
+## 6. Notifications (re-scan QR / WAHA down)
+
+- WAHA sends a webhook (`session.status`) on every session change (`WORKING`,
+  `SCAN_QR_CODE`, `FAILED`, `STOPPED`). Anything other than `WORKING` → **notify the
+  admins**.
+- The alert can't go over WhatsApp, because the bot's own session is the thing that's
+  down. Use **email (SES)** first. Optionally also a Telegram bot message, or SNS→SMS.
+- The **cron health check** (every 5–10 minutes) calls WAHA `GET /api/sessions/default`.
+  It catches the case where WAHA itself has crashed and so can't send a webhook. Alerts
+  are de-duplicated, so admins get one message per incident.
+- The web app has a **"WhatsApp session" page** showing the live QR (`/api/{session}/auth/qr`)
+  and a **pairing code** option (`/api/{session}/auth/request-code`). With the pairing
+  code, the phone owner just types an 8-character code on the phone and doesn't have to
+  scan anything.
+
+## 7. Features (final scope)
+
+| # | Feature | Notes |
+|---|---|---|
+| F1 | Service groups & services (code, alias, POC, order, active) | CRUD and reordering |
+| F2 | Templates: target group, header, footer, update header, closing message, included services | Placeholders such as `{{title}}`, `{{date}}`, `{{outstanding}}`, `{{summary}}`. The target group is chosen from WAHA's group list. |
+| F3 | New verification wizard: template → edit header → **preview** → send | The preview is the exact WhatsApp text |
+| F4 | Live status grid | Polls every few seconds. Lambda doesn't keep connections open, so polling is simpler than SSE/WebSockets. |
+| F5 | Auto-parse replies | §5 |
+| F6 | Manual override and "Send updated list" | Sends a new message built from the current state |
+| F7 | Pending service suggestions | §5.6 |
+| F8 | Close verification → closing message | Then parsing stops for that verification |
+| F9 | Delete one of our sent messages | From the list of sent messages in the verification view |
+| F10 | Session health and QR alerts | §6 |
+| F11 | Access control | §4 |
+
+## 8. Data model (DynamoDB, single table with ElectroDB)
+
+| Entity | Key (PK / SK) | Fields |
+|---|---|---|
+| ServiceGroup | `GROUP` / `GROUP#<id>` | name, order |
+| Service | `SERVICE` / `SERVICE#<id>` | groupId, code, alias, poc, order, active |
+| Template | `TEMPLATE` / `TEMPLATE#<id>` | name, chatId, header, footer, updateHeader, closingMessage, serviceIds[] |
+| Verification | `VERIF#<id>` / `META` | templateId, title, header, status (DRAFT/OPEN/CLOSED), chatId, openedBy, openedAt, closedAt |
+| VerificationItem | `VERIF#<id>` / `ITEM#<serviceId>` | snapshot of code, POC and group; status; updatedBy; updatedAt |
+| OutboundMessage | `VERIF#<id>` / `OUT#<ts>` | kind (INITIAL/UPDATE/CLOSE), waMessageId, body, sentBy, deleted |
+| StatusEvent | `VERIF#<id>` / `EVT#<ts>#<n>` | serviceId, old, new, source (WHATSAPP/ADMIN), sender, waMessageId, rawLine |
+| Suggestion | `SUGGEST` / `SUGGEST#<code>` | poc, groupHint, seenCount, firstSeen, raw, status |
+| Index: open verification by chat | GSI1: `CHAT#<chatId>` / `OPEN` | Used by the webhook to look up the verification fast |
+| Processed message (dedupe) | `MSG#<waId>` / `MSG` | TTL of 7 days |
+
+Postgres (e.g. Neon) with Drizzle would also work if we'd rather use SQL. Only the data
+layer would change.
+
+## 9. Decisions log (from the team)
+
+| Topic | Decision |
+|---|---|
+| Channel | WhatsApp is required, because external parties are in the group |
+| Bot account | Dedicated spare number on the **WhatsApp Business app** |
+| Data classification | Not applicable (unofficial group) |
+| Group | A new test group with testers first, then the existing MHACS eServices group |
+| Editing messages | Never. Original and updates are sent as new messages. Deleting our own messages is supported. |
+| Who can update | Anyone in the group, for now |
+| Unknown services | Pending suggestion for an admin to approve in the web app |
+| Hosting | AWS: SST + OpenNext on Lambda. WAHA on Fargate (see §3). |
+| Access | Cloudflare Access if feasible (see §4), otherwise an IP allowlist from env vars, plus app login |
+| Language | TypeScript throughout. WAHA is a REST API, so Python adds nothing. TS types come from WAHA's OpenAPI spec. |
+
+## 10. Repository layout (proposed)
+
+```
+/                       SST v3 monorepo (pnpm workspaces)
+├─ sst.config.ts        Vpc, Efs, Cluster+Service(WAHA), Dynamo, Nextjs, Functions, Cron
+├─ packages/
+│  ├─ core/             domain logic: parser, renderer, entities, WAHA client (pure TS + tests)
+│  ├─ web/              Next.js admin app (OpenNext)
+│  └─ functions/        webhook handler, health-check cron
+└─ docs/PLAN.md
+```
+
+## 11. Phased delivery
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0 – Spike (1–2 days)** | Run WAHA in Docker, link a test number, send to a test group, capture webhook payloads, prototype the parser on real reposts. | A test-group message is sent, and replies parse correctly. **Policy check done.** |
-| **1 – MVP** | Services/groups/templates CRUD, wizard, send, manual status grid, send update, close. No auto-parsing yet. | Usable end-to-end with manual updates. |
-| **2 – Auto-parsing** | Webhook ingestion, parser, audit feed, live UI. | Real reposts update the grid with no admin input. |
-| **3 – Hardening** | IP allowlist at both layers, admin auth/roles, webhook HMAC, backups, session health alerts, rate limiting. | Security review passed. |
-| **4 – Nice-to-haves** | Reactions/quoted replies, a POC→sender phone mapping, scheduled reminders ("3 services still ❓"), CSV export, multiple channels. | — |
+| **0: Spike** | Run WAHA locally in Docker and link the Business number. Send to the test group. Record real webhook payloads and reposts. Choose the engine (**GOWS** or **NOWEB**: no Chromium, low memory) and check the needed features work in the free *Core* tier (one session is enough). | Sending, receiving, deleting and session-status events all work |
+| **1: Foundations** | SST infra (VPC, Fargate WAHA, EFS, DynamoDB, Next.js). IP allowlist. Admin login. | The admin app is reachable only from allowed IPs, and WAHA is reachable from the Lambdas |
+| **2: MVP sending** | Services, groups and templates CRUD. Wizard, preview, send. Manual grid, send update, close, delete message. | A full verification can be run by hand |
+| **3: Auto-parsing** | Webhook, parser (with tests from real reposts), audit feed, suggestions | Reposts in the test group update the grid by themselves |
+| **4: Ops** | Session alerts (SES), health cron, QR/pairing page, backups (DynamoDB PITR) | A forced logout produces an email within 10 minutes |
+| **5: Go-live** | Switch the template's target to the real group | — |
 
-## 9. Open questions for the team
+Rough running cost: Fargate (0.25 vCPU / 1 GB) about US$9, NAT instance about US$3–5, EFS
+under US$1. Lambda, DynamoDB and CloudFront are about free at this volume. **Total about
+US$15/month.** A Lightsail host for WAHA would bring that to about US$5–8.
 
-1. Is an unofficial WhatsApp integration (WAHA) acceptable under policy? If not, is a different channel (e.g. Teams, which we may already have) acceptable for the same workflow?
-2. Do we have a dedicated number/SIM for the bot, and who owns the phone?
-3. Should the bot send into the **existing** "MHACS eServices" group, or into a new group?
-4. Hosting: on-prem / GCC / a cloud VM? Which IPs or CIDRs need to be allowlisted?
-5. Should anyone in the group be able to update any service, or only the mapped POC?
-6. When a service is missing from the list (per the message: "If any eService is not in this list…"), should a new code in a reply create a **pending suggestion** for an admin to approve?
-7. Preferred stack: TypeScript or Python?
+## 12. Future enhancements
+
+- Restrict updates for a service to its mapped POC(s), matched by sender phone number.
+- Reminders ("3 services still ❓"), sent automatically or by an admin with one click.
+- React to the sender's message with 👍 once their changes are applied.
+- Accept quoted replies and emoji reactions as status updates.
+- CSV/PDF export of a closed verification.
+- Cloudflare Access, if a suitable Cloudflare zone becomes available.
